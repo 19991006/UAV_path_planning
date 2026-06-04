@@ -51,7 +51,6 @@ class UAVEnvConfig:
     start_y_gap: float = 3.0
 
     # Target settings.
-    num_targets: int = 3
     target_x: float = 8.0
     target_y_gap: float = 4.0
     arrival_threshold: float = 0.5
@@ -103,8 +102,7 @@ class UAVEnvConfig:
     freeze_arrived_uavs: bool = False
 
     # Reward settings.
-    progress_scale: float = 2.0
-    arrival_reward: float = 100.0
+    progress_scale: float = 10.0
     all_arrived_bonus: float = 100.0
     step_penalty: float = -0.1
 
@@ -142,11 +140,11 @@ class MultiUAV2DEnv:
         self.cfg = config or UAVEnvConfig()
         self.rng = np.random.default_rng(self.cfg.seed)
 
-        if self.cfg.num_targets < self.cfg.num_agents:
-            raise ValueError("This environment expects num_targets >= num_agents.")
+        if self.cfg.num_agents < 1:
+            raise ValueError("num_agents must be >= 1.")
 
         self.num_agents = self.cfg.num_agents
-        self.num_targets = self.cfg.num_targets
+        self.num_targets = self.cfg.num_agents
         self.action_dim = 2
         self.obs_dim = self.cfg.lidar_num_rays + 4 + 2 + 2 * (self.num_agents - 1)
 
@@ -284,7 +282,7 @@ class MultiUAV2DEnv:
         rewards = self._compute_rewards(
             previous_distances=previous_distances,
             current_distances=current_distances,
-            newly_arrived=newly_arrived,
+            current_agent_arrived=current_agent_arrived,
             all_arrived=all_arrived,
         )
 
@@ -642,15 +640,15 @@ class MultiUAV2DEnv:
         self,
         previous_distances: np.ndarray,
         current_distances: np.ndarray,
-        newly_arrived: np.ndarray,
+        current_agent_arrived: np.ndarray,
         all_arrived: bool,
     ) -> np.ndarray:
         """Simplified reward: progress toward target + task completion + time pressure."""
         progress = self.cfg.progress_scale * (previous_distances - current_distances)
+        progress = np.clip(progress, -1.0, 1.0)
+        progress[current_agent_arrived] = 1.0
 
         arrival = np.zeros((self.num_agents,), dtype=np.float32)
-        for agent_id in np.where(newly_arrived)[0]:
-            arrival[agent_id] = self.cfg.arrival_reward
         if all_arrived:
             arrival += self.cfg.all_arrived_bonus
 
@@ -955,7 +953,6 @@ class MultiUAV2DEnv:
 if __name__ == "__main__":
     cfg = UAVEnvConfig(
         num_agents=3,
-        num_targets=3,
         num_obstacles=10,
         assigner_name="hungarian",
         lidar_num_rays=35,
