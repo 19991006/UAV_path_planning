@@ -1,24 +1,15 @@
 """
-Evaluation and visualization script with parameters configured in code.
+Evaluation and visualization script.
 
-Required project files:
-    target_assignment.py
-    env.py
-    actor_critic.py
-    rollout_buffer.py
-    mappo.py
-
-Usage in PyCharm:
-    1. Open this file.
-    2. Modify the EvalConfig section below.
-    3. Right click evaluate.py -> Run 'evaluate'.
-
-No command-line parameters are required.
+Usage:
+    python evaluate.py <run_dir> [--episodes 10] [--no-plots] [--show]
+    python evaluate.py runs/mappo_N3_O20_fixed_S42
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import argparse
+import json
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -29,47 +20,32 @@ from env import MultiUAV2DEnv, UAVEnvConfig
 from mappo import MAPPOAgent, MAPPOConfig
 
 
-# =============================================================================
-# CONFIG: modify these parameters directly in PyCharm
-# =============================================================================
-@dataclass
-class EvalConfig:
-    # Checkpoint path.
-    # Change this to the model you want to evaluate.
-    checkpoint: str = "runs4/stage1_5_obstacles/checkpoints/final.pt"
-
-    # Output.
-    output_dir: str = "eval_outputs"
-    save_plots: bool = True
-    show_plots: bool = True
-
-    # Evaluation.
-    episodes: int = 10
-    deterministic: bool = True
-    device: str = "auto"  # "auto", "cpu", or "cuda"
-    seed: int = 42
-
-    # Environment. Keep these consistent with training.
-    num_agents: int = 3
-    num_targets: int = 3
-    num_obstacles: int = 5
-    max_steps: int = 600
-    assigner_name: str = "hungarian"  # "hungarian", "greedy", or "fixed"
-    lidar_num_rays: int = 35
-    lidar_range: float = 5.0
-
-    # Network config. Keep these consistent with training.
-    hidden_dim: int = 256
-    num_hidden_layers: int = 3
-    activation: str = "tanh"
-
-
-CFG = EvalConfig()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a trained DA-MAPPO policy.")
+    parser.add_argument("run_dir", type=str, help="Path to the training run directory")
+    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument("--deterministic", action="store_true", default=True)
+    parser.add_argument("--stochastic", dest="deterministic", action="store_false")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--seed", type=int, default=0, help="Override eval seed (0 = use training seed)")
+    parser.add_argument("--output-dir", type=str, default="eval_outputs")
+    parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument("--show", action="store_true", help="Show plots interactively")
+    return parser.parse_args()
 
 
 # =============================================================================
 # Utilities
 # =============================================================================
+def load_run_config(run_dir: Path) -> dict:
+    """Read config.json from a run directory."""
+    config_path = run_dir / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"config.json not found in {run_dir}")
+    with open(config_path) as f:
+        return json.load(f)
+
+
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -77,45 +53,36 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def make_env(cfg: EvalConfig, seed_offset: int = 0) -> MultiUAV2DEnv:
-    env_cfg = UAVEnvConfig(
-        num_agents=cfg.num_agents,
-        num_targets=cfg.num_targets,
-        num_obstacles=cfg.num_obstacles,
-        max_steps=cfg.max_steps,
-        assigner_name=cfg.assigner_name,
-        lidar_num_rays=cfg.lidar_num_rays,
-        lidar_range=cfg.lidar_range,
-        seed=cfg.seed + seed_offset,
+def make_env_from_config(train_args: dict, seed_offset: int = 0) -> MultiUAV2DEnv:
+    """Build env from saved training config."""
+    cfg = UAVEnvConfig(
+        num_agents=train_args["num_agents"],
+        num_obstacles=train_args["num_obstacles"],
+        max_steps=train_args["max_steps"],
+        assigner_name=train_args["assigner_name"],
+        lidar_num_rays=train_args["lidar_num_rays"],
+        lidar_range=train_args["lidar_range"],
+        seed=train_args["seed"] + seed_offset,
     )
-    return MultiUAV2DEnv(env_cfg)
+    return MultiUAV2DEnv(cfg)
 
 
-def make_agent_for_loading(env: MultiUAV2DEnv, cfg: EvalConfig) -> MAPPOAgent:
-    """
-    Build an agent with matching environment dimensions, then load checkpoint.
-
-    The optimizer hyperparameters do not matter for pure evaluation, but MAPPOAgent
-    needs a config to construct the model.
-    """
+def load_agent_from_run(env: MultiUAV2DEnv, run_dir: Path, train_args: dict, device: str) -> MAPPOAgent:
+    """Build agent from saved config and load best checkpoint."""
     mappo_cfg = MAPPOConfig(
-        rollout_steps=32,
-        ppo_epochs=1,
-        minibatch_size=32,
-        hidden_dim=cfg.hidden_dim,
-        num_hidden_layers=cfg.num_hidden_layers,
-        activation=cfg.activation,
-        device=cfg.device,
+        rollout_steps=train_args["rollout_steps"],
+        ppo_epochs=train_args["ppo_epochs"],
+        minibatch_size=train_args["minibatch_size"],
+        hidden_dim=train_args["hidden_dim"],
+        num_hidden_layers=train_args["num_hidden_layers"],
+        activation=train_args["activation"],
+        device=device,
     )
     agent = MAPPOAgent(env, mappo_cfg)
 
-    checkpoint_path = Path(cfg.checkpoint)
+    checkpoint_path = run_dir / "checkpoints" / "best.pt"
     if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path}\n"
-            "Please train first or update CFG.checkpoint in evaluate.py."
-        )
-
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     agent.load(checkpoint_path)
     agent.model.eval()
     return agent
@@ -273,35 +240,41 @@ def aggregate_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
 # Main evaluation
 # =============================================================================
 def main() -> None:
-    cfg = CFG
-    set_seed(cfg.seed)
+    args = parse_args()
+    run_dir = Path(args.run_dir)
+    train_args = load_run_config(run_dir)
+    print(f"Loaded config from: {run_dir / 'config.json'}")
 
-    output_dir = Path(cfg.output_dir)
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    env = make_env(cfg, seed_offset=0)
-    agent = make_agent_for_loading(env, cfg)
+    eval_seed = args.seed if args.seed != 0 else train_args.get("seed", 42)
+    set_seed(eval_seed)
+
+    env = make_env_from_config(train_args, seed_offset=0)
+    agent = load_agent_from_run(env, run_dir, train_args, args.device)
 
     print("DA-MAPPO evaluation started")
-    print(f"checkpoint: {cfg.checkpoint}")
+    print(f"run_dir: {run_dir}")
+    print(f"checkpoint: {run_dir / 'checkpoints' / 'best.pt'}")
     print(f"device: {agent.device}")
-    print(f"episodes: {cfg.episodes}")
+    print(f"episodes: {args.episodes}")
     print(f"num_agents: {env.num_agents}")
-    print(f"num_targets: {env.num_targets}")
-    print(f"num_obstacles: {cfg.num_obstacles}")
+    print(f"num_obstacles: {train_args['num_obstacles']}")
+    print(f"assigner: {train_args['assigner_name']}")
     print(f"obs_dim: {agent.obs_dim}")
     print(f"state_dim: {agent.state_dim}")
     print("-" * 80)
 
     all_metrics: List[Dict[str, float]] = []
 
-    for ep in range(cfg.episodes):
-        episode_seed = cfg.seed + ep
+    for ep in range(args.episodes):
+        episode_seed = eval_seed + ep
         metrics, trajectory_data = run_episode(
             agent=agent,
             env=env,
             seed=episode_seed,
-            deterministic=cfg.deterministic,
+            deterministic=args.deterministic,
         )
         all_metrics.append(metrics)
 
@@ -314,13 +287,13 @@ def main() -> None:
             f"reason={reason}"
         )
 
-        if cfg.save_plots or cfg.show_plots:
-            plot_path = output_dir / f"trajectory_ep_{ep + 1:03d}.png" if cfg.save_plots else None
+        if not args.no_plots or args.show:
+            plot_path = output_dir / f"trajectory_ep_{ep + 1:03d}.png" if not args.no_plots else None
             plot_trajectory(
                 trajectory_data=trajectory_data,
                 env_cfg=env.cfg,
                 output_path=plot_path,
-                show=cfg.show_plots,
+                show=args.show,
                 title=f"DA-MAPPO Evaluation Episode {ep + 1}",
             )
 
@@ -330,7 +303,7 @@ def main() -> None:
     for key, value in aggregated.items():
         print(f"{key}: {value:.6f}")
 
-    if cfg.save_plots:
+    if not args.no_plots:
         print(f"Trajectory plots saved to: {output_dir.resolve()}")
 
 
