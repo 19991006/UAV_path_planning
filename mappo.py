@@ -374,7 +374,6 @@ if __name__ == "__main__":
 
     env_cfg = UAVEnvConfig(
         num_agents=3,
-        num_targets=3,
         num_obstacles=5,
         assigner_name="hungarian",
         seed=seed,
