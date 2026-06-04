@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import random
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ from typing import Dict
 
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from env import MultiUAV2DEnv, UAVEnvConfig
 from mappo import MAPPOAgent, MAPPOConfig
@@ -37,32 +39,31 @@ def parse_args() -> argparse.Namespace:
     # General.
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--run-name", type=str, default="stage3.2_15_obstacles")
-    parser.add_argument("--save-dir", type=str, default="runs3")
+    parser.add_argument("--run-name", type=str, default="mappo")
+    parser.add_argument("--save-dir", type=str, default="runs")
     parser.add_argument(
         "--resume-checkpoint",
         type=str,
-        default="runs3/stage3.1_15_obstacles/checkpoints/final.pt",
+        default=None,
         help="Path to checkpoint for continuing training."
     )
 
     # Environment.
     parser.add_argument("--num-agents", type=int, default=3)
-    parser.add_argument("--num-targets", type=int, default=3)
-    parser.add_argument("--num-obstacles", type=int, default=15)
+    parser.add_argument("--num-obstacles", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=600)
-    parser.add_argument("--assigner-name", type=str, default="hungarian", choices=["hungarian", "greedy", "fixed"])
+    parser.add_argument("--assigner-name", type=str, default="fixed", choices=["hungarian", "greedy", "fixed", "cross"])
     parser.add_argument("--lidar-num-rays", type=int, default=35)
     parser.add_argument("--lidar-range", type=float, default=5.0)
 
     # Training.
-    parser.add_argument("--total-updates", type=int, default=500)
+    parser.add_argument("--total-updates", type=int, default=1000)
     parser.add_argument("--rollout-steps", type=int, default=512)
     parser.add_argument("--ppo-epochs", type=int, default=10)
-    parser.add_argument("--minibatch-size", type=int, default=512)
+    parser.add_argument("--minibatch-size", type=int, default=64)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--actor-lr", type=float, default=3e-4)
+    parser.add_argument("--actor-lr", type=float, default=3e-5)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--clip-coef", type=float, default=0.2)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
@@ -70,14 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
 
     # Network.
-    parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--num-hidden-layers", type=int, default=3)
-    parser.add_argument("--activation", type=str, default="tanh", choices=["tanh", "relu", "gelu", "elu"])
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--num-hidden-layers", type=int, default=2)
+    parser.add_argument("--activation", type=str, default="relu", choices=["tanh", "relu", "gelu", "elu"])
 
     # Logging / saving / evaluation.
     parser.add_argument("--log-interval", type=int, default=1)
-    parser.add_argument("--eval-interval", type=int, default=10)
-    parser.add_argument("--save-interval", type=int, default=50)
+    parser.add_argument("--eval-interval", type=int, default=100)
+    parser.add_argument("--save-interval", type=int, default=100)
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--deterministic-eval", action="store_true", default=True)
 
@@ -97,7 +98,6 @@ def set_seed(seed: int) -> None:
 def make_env(args: argparse.Namespace, seed_offset: int = 0) -> MultiUAV2DEnv:
     cfg = UAVEnvConfig(
         num_agents=args.num_agents,
-        num_targets=args.num_targets,
         num_obstacles=args.num_obstacles,
         max_steps=args.max_steps,
         assigner_name=args.assigner_name,
@@ -219,10 +219,19 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    run_dir = Path(args.save_dir) / args.run_name
+    tag = f"{args.run_name}_N{args.num_agents}_O{args.num_obstacles}_{args.assigner_name}_S{args.seed}"
+    run_dir = Path(args.save_dir) / tag
     checkpoint_dir = run_dir / "checkpoints"
     csv_path = run_dir / "metrics.csv"
+    log_dir = run_dir / "tensorboard"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    config_path = run_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(vars(args), f, indent=2)
+    print(f"Config saved to: {config_path}")
+
+    writer = SummaryWriter(log_dir)
 
     env = make_env(args, seed_offset=0)
     eval_env = make_env(args, seed_offset=999)
@@ -255,6 +264,10 @@ def main() -> None:
             **train_metrics,
         }
 
+        # TensorBoard: log every update
+        for key, value in train_metrics.items():
+            writer.add_scalar(f"train/{key}", value, update)
+
         should_eval = args.eval_interval > 0 and update % args.eval_interval == 0
         if should_eval:
             eval_metrics = evaluate_policy(
@@ -264,6 +277,8 @@ def main() -> None:
                 deterministic=args.deterministic_eval,
             )
             metrics.update(eval_metrics)
+            for key, value in eval_metrics.items():
+                writer.add_scalar(f"eval/{key}", value, update)
 
             if eval_metrics["eval_mean_return"] > best_eval_return:
                 best_eval_return = eval_metrics["eval_mean_return"]
@@ -282,8 +297,10 @@ def main() -> None:
             print(format_metrics(metrics))
 
     agent.save(checkpoint_dir / "final.pt")
+    writer.close()
     print("-" * 80)
     print("Training finished")
+    print(f"TensorBoard: tensorboard --logdir {log_dir}")
     print(f"Final checkpoint: {checkpoint_dir / 'final.pt'}")
     print(f"Metrics CSV: {csv_path}")
 
