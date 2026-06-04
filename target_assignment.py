@@ -223,6 +223,37 @@ class FixedTargetAssigner(BaseTargetAssigner):
         return assignments, cost_matrix, info
 
 
+class CrossTargetAssigner(BaseTargetAssigner):
+    """
+    Cross assignment baseline: agent i -> target (N-1-i).
+
+    Maps agents to targets in reverse order. For 3 agents:
+        agent 0 -> target 2, agent 1 -> target 1, agent 2 -> target 0.
+
+    Useful for testing whether the policy can handle crossed paths.
+    """
+
+    def assign(
+        self,
+        agent_positions: np.ndarray,
+        target_positions: np.ndarray,
+        **kwargs,
+    ) -> AssignmentResult:
+        HungarianTargetAssigner._validate_inputs(agent_positions, target_positions)
+
+        num_agents = agent_positions.shape[0]
+        assignments = np.array([num_agents - 1 - i for i in range(num_agents)], dtype=np.int64)
+
+        diff = agent_positions[:, None, :] - target_positions[None, :, :]
+        cost_matrix = np.sum(diff ** 2, axis=-1).astype(np.float32)
+
+        info = {
+            "assigner": "cross",
+            "total_assignment_cost": float(sum(cost_matrix[i, assignments[i]] for i in range(num_agents))),
+        }
+        return assignments, cost_matrix, info
+
+
 def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
     """
     Factory function for convenient config-based construction.
@@ -239,6 +270,8 @@ def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
         return GreedyNearestTargetAssigner(**kwargs)
     if name in {"fixed", "identity"}:
         return FixedTargetAssigner()
+    if name in {"cross", "reverse"}:
+        return CrossTargetAssigner()
     raise ValueError(f"Unknown assigner name: {name}")
 
 
