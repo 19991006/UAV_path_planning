@@ -105,6 +105,7 @@ class UAVEnvConfig:
     progress_scale: float = 10.0
     all_arrived_bonus: float = 100.0
     step_penalty: float = -0.1
+    collision_penalty: float = -100.0
 
     # Centralized critic global state settings.
     critic_include_joint_obs: bool = False
@@ -285,6 +286,33 @@ class MultiUAV2DEnv:
             current_agent_arrived=current_agent_arrived,
             all_arrived=all_arrived,
         )
+
+        # Sparse collision penalty: only penalize agents involved in the collision.
+        collision_penalty = np.zeros((self.num_agents,), dtype=np.float32)
+        penalty = self.cfg.collision_penalty
+
+        if inter_agent_collision:
+            for i in range(self.num_agents):
+                for j in range(i + 1, self.num_agents):
+                    dist = np.linalg.norm(self.positions[i] - self.positions[j])
+                    if dist <= self.cfg.inter_agent_min_distance:
+                        collision_penalty[i] += penalty
+                        collision_penalty[j] += penalty
+
+        if obstacle_collision:
+            for i in range(self.num_agents):
+                for c, r in zip(self.obstacle_centers, self.obstacle_radii):
+                    dist = np.linalg.norm(self.positions[i] - c)
+                    if dist <= self.cfg.uav_radius + r + self.cfg.obstacle_safety_margin:
+                        collision_penalty[i] += penalty
+
+        if boundary_violation:
+            half = self.cfg.world_size / 2.0
+            for i in range(self.num_agents):
+                if np.any(np.abs(self.positions[i]) > half):
+                    collision_penalty[i] += penalty
+
+        rewards = rewards + collision_penalty
 
         # Mark agents that have already collected the one-time arrival bonus.
         self.arrived |= newly_arrived
