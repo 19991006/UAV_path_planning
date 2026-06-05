@@ -48,7 +48,11 @@ class UAVEnvConfig:
 
     # Initial UAV layout.
     start_x: float = -8.0
-    start_y_gap: float = 3.0
+    start_y_gap: float = 4.0
+
+    # Layout mode: "same_side" (all agents left, all targets right) or
+    # "cross" (agents and targets interleaved on both sides).
+    layout_mode: str = "same_side"
 
     # Target settings.
     target_x: float = 8.0
@@ -104,7 +108,7 @@ class UAVEnvConfig:
     # Reward settings.
     progress_scale: float = 10.0
     all_arrived_bonus: float = 100.0
-    step_penalty: float = -0.1
+    step_penalty: float = -0.3
     collision_penalty: float = -100.0
 
     # Centralized critic global state settings.
@@ -113,6 +117,30 @@ class UAVEnvConfig:
     critic_include_cost_matrix: bool = False
 
     seed: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.num_agents <= 5:
+            scale_factor = 1.0
+        elif 5 < self.num_agents <= 10:
+            scale_factor = 2.0
+        else:
+            scale_factor = 3.0
+        self.world_size *= scale_factor
+        self.start_x *= scale_factor
+        self.target_x *= scale_factor
+        self.obstacle_area_x_min *= scale_factor
+        self.obstacle_area_x_max *= scale_factor
+
+        if self.layout_mode == "cross" and self.assigner_name == "cross" and self.num_agents % 2 == 0:
+            raise ValueError(
+                f"layout_mode='cross' + assigner_name='cross' with even num_agents "
+                f"({self.num_agents}) results in same-side assignments. "
+                "Use odd num_agents or change one of the two settings."
+            )
+        self.obstacle_area_y_min *= scale_factor
+        self.obstacle_area_y_max *= scale_factor
+        self.target_area_x_min *= scale_factor
+        self.target_area_x_max *= scale_factor
 
 
 class MultiUAV2DEnv:
@@ -204,8 +232,11 @@ class MultiUAV2DEnv:
         self.termination_reason = ""
         self.last_reward_terms = {}
 
-        self._reset_uavs()
-        self._reset_targets()
+        if self.cfg.layout_mode == "cross":
+            self._reset_layout_cross()
+        else:
+            self._reset_uavs()
+            self._reset_targets()
         self._generate_obstacles()
         self._update_assignments()
 
@@ -265,9 +296,26 @@ class MultiUAV2DEnv:
 
         all_arrived = bool(np.all(current_agent_arrived))
 
-        boundary_violation = self._check_boundary_violation()
-        obstacle_collision = self._check_obstacle_collision()
-        inter_agent_collision = self._check_inter_agent_collision()
+        # Pre-compute collision distance matrices once; reuse for check + penalty.
+        half = self.cfg.world_size / 2.0
+        boundary_violation = bool(np.any(np.abs(self.positions) > half))
+
+        # Agent-obstacle distances.
+        if self.obstacle_centers.shape[0] > 0:
+            ao_diff = self.positions[:, None, :] - self.obstacle_centers[None, :, :]
+            ao_dists = np.linalg.norm(ao_diff, axis=-1)
+            ao_thresh = self.cfg.uav_radius + self.obstacle_radii + self.cfg.obstacle_safety_margin
+            ao_mask = ao_dists <= ao_thresh[None, :]
+            obstacle_collision = bool(np.any(ao_mask))
+        else:
+            obstacle_collision = False
+
+        # Inter-agent distances.
+        ia_diff = self.positions[:, None, :] - self.positions[None, :, :]
+        ia_dists = np.linalg.norm(ia_diff, axis=-1)
+        ia_mask = (ia_dists <= self.cfg.inter_agent_min_distance) & ~np.eye(self.num_agents, dtype=bool)
+        inter_agent_collision = bool(np.any(ia_mask))
+
         timeout = self.step_count >= self.cfg.max_steps
 
         failure = bool(boundary_violation or obstacle_collision or inter_agent_collision)
@@ -287,30 +335,15 @@ class MultiUAV2DEnv:
             all_arrived=all_arrived,
         )
 
-        # Sparse collision penalty: only penalize agents involved in the collision.
+        # Collision penalty from pre-computed masks.
         collision_penalty = np.zeros((self.num_agents,), dtype=np.float32)
         penalty = self.cfg.collision_penalty
-
         if inter_agent_collision:
-            for i in range(self.num_agents):
-                for j in range(i + 1, self.num_agents):
-                    dist = np.linalg.norm(self.positions[i] - self.positions[j])
-                    if dist <= self.cfg.inter_agent_min_distance:
-                        collision_penalty[i] += penalty
-                        collision_penalty[j] += penalty
-
+            collision_penalty += ia_mask.sum(axis=1).astype(np.float32) * penalty
         if obstacle_collision:
-            for i in range(self.num_agents):
-                for c, r in zip(self.obstacle_centers, self.obstacle_radii):
-                    dist = np.linalg.norm(self.positions[i] - c)
-                    if dist <= self.cfg.uav_radius + r + self.cfg.obstacle_safety_margin:
-                        collision_penalty[i] += penalty
-
+            collision_penalty += ao_mask.sum(axis=1).astype(np.float32) * penalty
         if boundary_violation:
-            half = self.cfg.world_size / 2.0
-            for i in range(self.num_agents):
-                if np.any(np.abs(self.positions[i]) > half):
-                    collision_penalty[i] += penalty
+            collision_penalty[np.any(np.abs(self.positions) > half, axis=1)] += penalty
 
         rewards = rewards + collision_penalty
 
@@ -398,6 +431,39 @@ class MultiUAV2DEnv:
             angles = self.rng.uniform(-np.pi, np.pi, size=(self.num_targets,))
             self.target_velocities[:, 0] = self.cfg.target_speed * np.cos(angles)
             self.target_velocities[:, 1] = self.cfg.target_speed * np.sin(angles)
+
+    def _reset_layout_cross(self) -> None:
+        """Cross layout: interleave agents and targets on both sides.
+
+        Left side  (x=start_x):  A0 T1 A2 T3 A4 ...
+        Right side (x=target_x): T0 A1 T2 A3 T4 ...
+        """
+        gap = self.cfg.start_y_gap
+        center = (self.num_agents - 1) / 2.0
+
+        for slot in range(self.num_agents):
+            y = (slot - center) * gap
+            if slot % 2 == 0:
+                # Even slot: agent left, target right
+                self.positions[slot, 0] = self.cfg.start_x
+                self.positions[slot, 1] = y
+                self.target_positions[slot, 0] = self.cfg.target_x
+                self.target_positions[slot, 1] = y
+            else:
+                # Odd slot: target left, agent right
+                self.positions[slot, 0] = self.cfg.target_x
+                self.positions[slot, 1] = y
+                self.target_positions[slot, 0] = self.cfg.start_x
+                self.target_positions[slot, 1] = y
+
+        self.headings[:] = 0.0
+        self.linear_velocities[:] = 0.0
+        self.angular_velocities[:] = 0.0
+        self.previous_linear_velocities[:] = 0.0
+        self.previous_angular_velocities[:] = 0.0
+        self.linear_accelerations[:] = 0.0
+        self.angular_accelerations[:] = 0.0
+        self.target_velocities[:] = 0.0
 
     def _maybe_update_dynamic_targets(self) -> None:
         """Update target positions for dynamic-target experiments."""
@@ -554,68 +620,47 @@ class MultiUAV2DEnv:
         return obs.astype(np.float32)
 
     def _compute_lidar_observations(self) -> np.ndarray:
-        """
-        Simulate simple 2D LiDAR by ray-circle intersection.
-
-        Output is normalized to [0, 1]:
-            1.0 means no obstacle within lidar_range.
-            smaller values mean closer obstacles.
-        """
+        """Vectorized 2D LiDAR via batch ray-circle intersection."""
         num_rays = self.cfg.lidar_num_rays
         max_range = self.cfg.lidar_range
         half_fov = self.cfg.lidar_fov / 2.0
         relative_angles = np.linspace(-half_fov, half_fov, num_rays, endpoint=False, dtype=np.float32)
 
-        lidar = np.full((self.num_agents, num_rays), max_range, dtype=np.float32)
         if self.obstacle_centers.shape[0] == 0:
-            return lidar / max_range
+            return np.ones((self.num_agents, num_rays), dtype=np.float32)
 
-        for i in range(self.num_agents):
-            origin = self.positions[i]
-            ray_angles = self.headings[i] + relative_angles
-            ray_dirs = np.stack([np.cos(ray_angles), np.sin(ray_angles)], axis=1).astype(np.float32)
+        # Ray directions for all agents: (N, R, 2)
+        ray_angles = self.headings[:, None] + relative_angles[None, :]
+        ray_dirs = np.stack([np.cos(ray_angles), np.sin(ray_angles)], axis=-1)
 
-            for r_id, direction in enumerate(ray_dirs):
-                closest = max_range
-                for center, radius in zip(self.obstacle_centers, self.obstacle_radii):
-                    hit_distance = self._ray_circle_intersection_distance(
-                        origin=origin,
-                        direction=direction,
-                        center=center,
-                        radius=radius + self.cfg.uav_radius + self.cfg.obstacle_safety_margin,
-                        max_range=max_range,
-                    )
-                    if hit_distance is not None and hit_distance < closest:
-                        closest = hit_distance
-                lidar[i, r_id] = closest
+        # Broadcast shapes: (N, 1, 1, 2) × (1, R, 1, 2) → (N, R, O, 2)
+        origins = self.positions[:, None, None, :]
+        dirs = ray_dirs[:, :, None, :]
+        centers = self.obstacle_centers[None, None, :, :]
+        radii = self.obstacle_radii[None, None, :] + self.cfg.uav_radius + self.cfg.obstacle_safety_margin
 
-        return np.clip(lidar / max_range, 0.0, 1.0).astype(np.float32)
+        # Ray-circle intersection: all (N, R, O) at once.
+        oc = origins - centers
+        b = 2.0 * np.sum(dirs * oc, axis=-1)
+        c = np.sum(oc ** 2, axis=-1) - radii ** 2
+        disc = b ** 2 - 4.0 * c
 
-    @staticmethod
-    def _ray_circle_intersection_distance(
-        origin: np.ndarray,
-        direction: np.ndarray,
-        center: np.ndarray,
-        radius: float,
-        max_range: float,
-    ) -> Optional[float]:
-        """Return nearest positive intersection distance between a ray and a circle."""
-        oc = origin - center
-        b = 2.0 * float(np.dot(direction, oc))
-        c = float(np.dot(oc, oc) - radius * radius)
-        discriminant = b * b - 4.0 * c
-
-        if discriminant < 0.0:
-            return None
-
-        sqrt_disc = np.sqrt(discriminant)
+        lidar = np.full((self.num_agents, num_rays), max_range, dtype=np.float32)
+        valid = disc >= 0
+        sqrt_disc = np.sqrt(np.maximum(disc, 0.0))
         t1 = (-b - sqrt_disc) / 2.0
         t2 = (-b + sqrt_disc) / 2.0
 
-        candidates = [t for t in (t1, t2) if 0.0 <= t <= max_range]
-        if not candidates:
-            return None
-        return float(min(candidates))
+        t1_ok = valid & (t1 >= 0) & (t1 <= max_range)
+        t2_ok = valid & (t2 >= 0) & (t2 <= max_range)
+
+        both = np.minimum(
+            np.where(t1_ok, t1, max_range * 2),
+            np.where(t2_ok, t2, max_range * 2),
+        )
+        np.min(both, axis=-1, out=lidar)
+
+        return (lidar / max_range).clip(0.0, 1.0).astype(np.float32)
 
     def _compute_ego_motion_observations(self) -> np.ndarray:
         """u_i = [v, omega, a_v, a_omega], normalized."""
@@ -643,23 +688,18 @@ class MultiUAV2DEnv:
         return np.stack([distance_norm, bearing_norm], axis=1).astype(np.float32)
 
     def _compute_topology_observations(self) -> np.ndarray:
-        """q_i = normalized relative positions of all teammates."""
-        topology = np.zeros((self.num_agents, 2 * (self.num_agents - 1)), dtype=np.float32)
+        """q_i = normalized relative positions of all teammates (vectorized)."""
         scale = self.cfg.world_size
+        rel = self.positions[None, :, :] - self.positions[:, None, :]  # (N, N, 2)
+        mask = ~np.eye(self.num_agents, dtype=bool)
+        rel = rel[mask]  # (N*(N-1), 2)
 
-        for i in range(self.num_agents):
-            features = []
-            for j in range(self.num_agents):
-                if i == j:
-                    continue
-                rel = self.positions[j] - self.positions[i]
-                dist = np.linalg.norm(rel)
-                if self.cfg.use_communication_range_mask and dist > self.cfg.communication_range:
-                    rel = np.zeros(2, dtype=np.float32)
-                features.extend((rel / scale).tolist())
-            topology[i] = np.asarray(features, dtype=np.float32)
+        if self.cfg.use_communication_range_mask:
+            dist = np.linalg.norm(rel, axis=-1)
+            rel[dist > self.cfg.communication_range] = 0.0
 
-        return topology
+        topology = (rel / scale).reshape(self.num_agents, 2 * (self.num_agents - 1))
+        return topology.astype(np.float32)
 
     # ------------------------------------------------------------------
     # Reward
@@ -713,27 +753,6 @@ class MultiUAV2DEnv:
     def _compute_assigned_target_vectors(self) -> np.ndarray:
         assigned_targets = self.target_positions[self.assignments]
         return (assigned_targets - self.positions).astype(np.float32)
-
-    def _check_boundary_violation(self) -> bool:
-        half_size = self.cfg.world_size / 2.0
-        return bool(np.any(np.abs(self.positions) > half_size))
-
-    def _check_obstacle_collision(self) -> bool:
-        if self.obstacle_centers.shape[0] == 0:
-            return False
-
-        diff = self.positions[:, None, :] - self.obstacle_centers[None, :, :]
-        distances = np.linalg.norm(diff, axis=-1)
-        collision_thresholds = self.cfg.uav_radius + self.obstacle_radii + self.cfg.obstacle_safety_margin
-        return bool(np.any(distances <= collision_thresholds[None, :]))
-
-    def _check_inter_agent_collision(self) -> bool:
-        for i in range(self.num_agents):
-            for j in range(i + 1, self.num_agents):
-                dist = np.linalg.norm(self.positions[i] - self.positions[j])
-                if dist <= self.cfg.inter_agent_min_distance:
-                    return True
-        return False
 
     def _build_termination_reason(
         self,
