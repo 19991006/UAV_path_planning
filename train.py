@@ -68,6 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-coef", type=float, default=0.2)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--value-loss-coef", type=float, default=0.5)
+    parser.add_argument("--target-kl", type=float, default=0.02,
+                        help="Early stop PPO epoch if mean KL exceeds this (0 = disabled)")
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
 
     # Network.
@@ -119,6 +121,7 @@ def make_agent(env: MultiUAV2DEnv, args: argparse.Namespace) -> MAPPOAgent:
         entropy_coef=args.entropy_coef,
         value_loss_coef=args.value_loss_coef,
         max_grad_norm=args.max_grad_norm,
+        target_kl=args.target_kl,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
         hidden_dim=args.hidden_dim,
@@ -157,7 +160,7 @@ def evaluate_policy(
             done = bool(np.all(dones))
 
         reason = info.get("termination_reason", "")
-        if "success_all_arrived" in reason:
+        if "success" in reason:
             success_count += 1
         if "collision" in reason or "boundary_violation" in reason:
             collision_count += 1
@@ -219,7 +222,8 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
-    tag = f"{args.run_name}_N{args.num_agents}_O{args.num_obstacles}_{args.assigner_name}_S{args.seed}"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    tag = f"{args.run_name}_N{args.num_agents}_O{args.num_obstacles}_{args.assigner_name}_S{args.seed}_{timestamp}"
     run_dir = Path(args.save_dir) / tag
     checkpoint_dir = run_dir / "checkpoints"
     csv_path = run_dir / "metrics.csv"
