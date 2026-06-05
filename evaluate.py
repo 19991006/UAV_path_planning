@@ -29,8 +29,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--seed", type=int, default=0, help="Override eval seed (0 = use training seed)")
     parser.add_argument("--output-dir", type=str, default="eval_outputs")
+    parser.add_argument("--checkpoint", type=str, default="best.pt",
+                        help="Checkpoint filename in run_dir/checkpoints/ (default: best.pt)")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--show", action="store_true", help="Show plots interactively")
+    parser.add_argument("--num-obstacles", type=int, default=None,
+                        help="Override num_obstacles from training config")
+    parser.add_argument("--save-video", action="store_true", help="Save MP4 video of the best episode")
+    parser.add_argument("--video-fps", type=int, default=10, help="FPS for saved video (default: 10)")
     return parser.parse_args()
 
 
@@ -53,11 +59,12 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def make_env_from_config(train_args: dict, seed_offset: int = 0) -> MultiUAV2DEnv:
+def make_env_from_config(train_args: dict, seed_offset: int = 0,
+                        num_obstacles: int | None = None) -> MultiUAV2DEnv:
     """Build env from saved training config."""
     cfg = UAVEnvConfig(
         num_agents=train_args["num_agents"],
-        num_obstacles=train_args["num_obstacles"],
+        num_obstacles=num_obstacles if num_obstacles is not None else train_args["num_obstacles"],
         max_steps=train_args["max_steps"],
         assigner_name=train_args["assigner_name"],
         lidar_num_rays=train_args["lidar_num_rays"],
@@ -67,8 +74,9 @@ def make_env_from_config(train_args: dict, seed_offset: int = 0) -> MultiUAV2DEn
     return MultiUAV2DEnv(cfg)
 
 
-def load_agent_from_run(env: MultiUAV2DEnv, run_dir: Path, train_args: dict, device: str) -> MAPPOAgent:
-    """Build agent from saved config and load best checkpoint."""
+def load_agent_from_run(env: MultiUAV2DEnv, run_dir: Path, train_args: dict, device: str,
+                        checkpoint: str = "best.pt") -> MAPPOAgent:
+    """Build agent from saved config and load checkpoint."""
     mappo_cfg = MAPPOConfig(
         rollout_steps=train_args["rollout_steps"],
         ppo_epochs=train_args["ppo_epochs"],
@@ -80,7 +88,7 @@ def load_agent_from_run(env: MultiUAV2DEnv, run_dir: Path, train_args: dict, dev
     )
     agent = MAPPOAgent(env, mappo_cfg)
 
-    checkpoint_path = run_dir / "checkpoints" / "best.pt"
+    checkpoint_path = run_dir / "checkpoints" / checkpoint
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     agent.load(checkpoint_path)
@@ -121,7 +129,7 @@ def run_episode(
         done = bool(np.all(dones))
 
     reason = info.get("termination_reason", "")
-    success = float("success_all_arrived" in reason)
+    success = float("success" in reason)
     collision_or_boundary = float("collision" in reason or "boundary_violation" in reason)
     timeout = float("timeout" in reason)
 
@@ -222,6 +230,91 @@ def plot_trajectory(
         plt.close(fig)
 
 
+def animate_trajectory(
+    trajectory_data: Dict[str, np.ndarray | str],
+    env_cfg: UAVEnvConfig,
+    output_path: Path,
+    fps: int = 10,
+    title: str = "DA-MAPPO Evaluation Trajectory",
+) -> None:
+    """Save an MP4 video of the trajectory animation."""
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, writers
+
+    positions_history = trajectory_data["positions_history"]
+    target_positions = trajectory_data["target_positions"]
+    obstacle_centers = trajectory_data["obstacle_centers"]
+    obstacle_radii = trajectory_data["obstacle_radii"]
+    final_assignments = trajectory_data["final_assignments"]
+    reward_history = trajectory_data["reward_history"]
+    reason = trajectory_data["termination_reason"]
+
+    num_agents = positions_history.shape[1]
+    num_steps = positions_history.shape[0]
+    half_size = env_cfg.world_size / 2.0
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.set_xlim(-half_size, half_size)
+    ax.set_ylim(-half_size, half_size)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True)
+
+    # Static elements.
+    for center, radius in zip(obstacle_centers, obstacle_radii):
+        circle = plt.Circle(center, radius, fill=True, alpha=0.45)
+        ax.add_patch(circle)
+    ax.scatter(target_positions[:, 0], target_positions[:, 1], marker="*", s=180, label="Targets")
+    for t_id, target in enumerate(target_positions):
+        ax.text(target[0], target[1], f"T{t_id}")
+
+    # Animated elements.
+    trail_lines = [ax.plot([], [], linewidth=2, label=f"UAV {i}")[0] for i in range(num_agents)]
+    pos_dots = ax.plot([], [], "ko", ms=6)[0]
+    uav_labels = [ax.text(0, 0, f"U{i}", visible=False) for i in range(num_agents)]
+    assign_lines = [ax.plot([], [], "--", linewidth=1, alpha=0.5)[0] for i in range(num_agents)]
+    ax.legend(loc="upper left")
+
+    info_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", fontsize=9)
+
+    def update(frame: int):
+        end = frame + 1
+        for i in range(num_agents):
+            traj = positions_history[:end, i, :]
+            trail_lines[i].set_data(traj[:, 0], traj[:, 1])
+            x, y = positions_history[end - 1, i]
+            uav_labels[i].set_position((x, y))
+            uav_labels[i].set_visible(True)
+            tx, ty = target_positions[final_assignments[i]]
+            assign_lines[i].set_data([x, tx], [y, ty])
+
+        pos_dots.set_data(positions_history[end - 1, :, 0], positions_history[end - 1, :, 1])
+
+        parts = [f"step {end}/{num_steps}"]
+        if frame < len(reward_history):
+            parts.append(f"reward mean: {float(np.mean(reward_history[frame])):.3f}")
+        info_text.set_text("  ".join(parts))
+
+        ax.set_title(f"{title}\ntermination: {reason}")
+        return trail_lines + [pos_dots] + uav_labels + assign_lines + [info_text]
+
+    ani = FuncAnimation(fig, update, frames=num_steps, interval=1000 // fps, blit=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # matplotlib may not find ffmpeg automatically; check common conda locations.
+    if not writers.is_available("ffmpeg"):
+        candidates = [
+            Path("D:/anaconda3/envs/deepRL/Library/bin/ffmpeg.exe"),
+            Path("D:/anaconda3/Library/bin/ffmpeg.exe"),
+        ]
+        for p in candidates:
+            if p.exists():
+                plt.rcParams["animation.ffmpeg_path"] = str(p)
+                break
+
+    ani.save(str(output_path), writer="ffmpeg", fps=fps, dpi=150)
+    plt.close(fig)
+
+
 def aggregate_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
     """Aggregate episode metrics."""
     if not metrics_list:
@@ -242,21 +335,22 @@ def aggregate_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
 def main() -> None:
     args = parse_args()
     run_dir = Path(args.run_dir)
+    run_tag = args.run_dir.strip("\\").split("\\")[-1]
     train_args = load_run_config(run_dir)
     print(f"Loaded config from: {run_dir / 'config.json'}")
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir + f"/{run_tag}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     eval_seed = args.seed if args.seed != 0 else train_args.get("seed", 42)
     set_seed(eval_seed)
 
-    env = make_env_from_config(train_args, seed_offset=0)
-    agent = load_agent_from_run(env, run_dir, train_args, args.device)
+    env = make_env_from_config(train_args, seed_offset=0, num_obstacles=args.num_obstacles)
+    agent = load_agent_from_run(env, run_dir, train_args, args.device, args.checkpoint)
 
     print("DA-MAPPO evaluation started")
     print(f"run_dir: {run_dir}")
-    print(f"checkpoint: {run_dir / 'checkpoints' / 'best.pt'}")
+    print(f"checkpoint: {run_dir / 'checkpoints' / args.checkpoint}")
     print(f"device: {agent.device}")
     print(f"episodes: {args.episodes}")
     print(f"num_agents: {env.num_agents}")
@@ -267,6 +361,7 @@ def main() -> None:
     print("-" * 80)
 
     all_metrics: List[Dict[str, float]] = []
+    all_trajectories: List[Dict[str, np.ndarray | str]] = []
 
     for ep in range(args.episodes):
         episode_seed = eval_seed + ep
@@ -277,6 +372,7 @@ def main() -> None:
             deterministic=args.deterministic,
         )
         all_metrics.append(metrics)
+        all_trajectories.append(trajectory_data)
 
         reason = trajectory_data["termination_reason"]
         print(
@@ -305,6 +401,20 @@ def main() -> None:
 
     if not args.no_plots:
         print(f"Trajectory plots saved to: {output_dir.resolve()}")
+
+    if args.save_video:
+        best_idx = int(np.argmax([m["episode_return_mean"] for m in all_metrics]))
+        best_return = all_metrics[best_idx]["episode_return_mean"]
+        video_path = output_dir / "trajectory_best.mp4"
+        print(f"Saving video for best episode (ep={best_idx + 1}, return_mean={best_return:.3f}) ...")
+        animate_trajectory(
+            trajectory_data=all_trajectories[best_idx],
+            env_cfg=env.cfg,
+            output_path=video_path,
+            fps=args.video_fps,
+            title=f"DA-MAPPO Best Episode {best_idx + 1}",
+        )
+        print(f"Video saved to: {video_path.resolve()}")
 
 
 if __name__ == "__main__":
