@@ -249,8 +249,8 @@ class MAPPOAgent:
             if self.cfg.target_kl > 0:
                 mean_epoch_kl = float(np.mean(epoch_kls))
                 if mean_epoch_kl > self.cfg.target_kl:
-                    print(f"  Early stop: epoch {epoch + 1}/{self.cfg.ppo_epochs}, "
-                          f"mean KL={mean_epoch_kl:.6f} > target_kl={self.cfg.target_kl}")
+                    # print(f"  Early stop: epoch {epoch + 1}/{self.cfg.ppo_epochs}, "
+                    #       f"mean KL={mean_epoch_kl:.6f} > target_kl={self.cfg.target_kl}")
                     break
 
         self.num_updates += 1
