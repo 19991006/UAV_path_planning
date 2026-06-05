@@ -57,6 +57,7 @@ class MAPPOConfig:
     max_grad_norm: float = 0.5
     normalize_advantages: bool = True
     use_value_clipping: bool = True
+    target_kl: float = 0.02
 
     # Optimizer settings.
     actor_lr: float = 3e-4
@@ -229,7 +230,8 @@ class MAPPOAgent:
         clip_fractions = []
         total_losses = []
 
-        for _ in range(self.cfg.ppo_epochs):
+        for epoch in range(self.cfg.ppo_epochs):
+            epoch_kls = []
             for batch in self.buffer.iter_minibatches(
                 batch_size=self.cfg.minibatch_size,
                 shuffle=True,
@@ -242,6 +244,14 @@ class MAPPOAgent:
                 approx_kls.append(metrics["approx_kl"])
                 clip_fractions.append(metrics["clip_fraction"])
                 total_losses.append(metrics["total_loss"])
+                epoch_kls.append(metrics["approx_kl"])
+
+            if self.cfg.target_kl > 0:
+                mean_epoch_kl = float(np.mean(epoch_kls))
+                if mean_epoch_kl > self.cfg.target_kl:
+                    print(f"  Early stop: epoch {epoch + 1}/{self.cfg.ppo_epochs}, "
+                          f"mean KL={mean_epoch_kl:.6f} > target_kl={self.cfg.target_kl}")
+                    break
 
         self.num_updates += 1
         return {
