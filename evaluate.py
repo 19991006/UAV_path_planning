@@ -69,6 +69,7 @@ def make_env_from_config(train_args: dict, seed_offset: int = 0,
         assigner_name=train_args["assigner_name"],
         lidar_num_rays=train_args["lidar_num_rays"],
         lidar_range=train_args["lidar_range"],
+        layout_mode=train_args.get("layout_mode", "same_side"),
         seed=train_args["seed"] + seed_offset,
     )
     return MultiUAV2DEnv(cfg)
@@ -274,7 +275,7 @@ def animate_trajectory(
     assign_lines = [ax.plot([], [], "--", linewidth=1, alpha=0.5)[0] for i in range(num_agents)]
     ax.legend(loc="upper left")
 
-    info_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top", fontsize=9)
+    info_text = ax.text(0.98, 0.98, "", transform=ax.transAxes, va="top", ha="right", fontsize=9)
 
     def update(frame: int):
         end = frame + 1
@@ -403,18 +404,30 @@ def main() -> None:
         print(f"Trajectory plots saved to: {output_dir.resolve()}")
 
     if args.save_video:
-        best_idx = int(np.argmax([m["episode_return_mean"] for m in all_metrics]))
-        best_return = all_metrics[best_idx]["episode_return_mean"]
-        video_path = output_dir / "trajectory_best.mp4"
-        print(f"Saving video for best episode (ep={best_idx + 1}, return_mean={best_return:.3f}) ...")
-        animate_trajectory(
-            trajectory_data=all_trajectories[best_idx],
-            env_cfg=env.cfg,
-            output_path=video_path,
-            fps=args.video_fps,
-            title=f"DA-MAPPO Best Episode {best_idx + 1}",
-        )
-        print(f"Video saved to: {video_path.resolve()}")
+        print("-" * 80)
+        print("Episode summary:")
+        for ep in range(args.episodes):
+            m = all_metrics[ep]
+            print(f"  ep={ep + 1:03d}  return_mean={m['episode_return_mean']:.3f}  "
+                  f"success={m['success']:.0f}  reason={all_trajectories[ep]['termination_reason']}")
+
+        raw = input("Enter episode numbers to save (e.g. 1,3,5), or press Enter to skip: ").strip()
+        if raw:
+            selected = [int(x.strip()) - 1 for x in raw.split(",") if x.strip().isdigit()]
+            for idx in selected:
+                if 0 <= idx < args.episodes:
+                    video_path = output_dir / f"trajectory_ep_{idx + 1:03d}.mp4"
+                    print(f"Saving video for episode {idx + 1} ...")
+                    animate_trajectory(
+                        trajectory_data=all_trajectories[idx],
+                        env_cfg=env.cfg,
+                        output_path=video_path,
+                        fps=args.video_fps,
+                        title=f"DA-MAPPO Episode {idx + 1}",
+                    )
+                    print(f"  saved to: {video_path}")
+        else:
+            print("Skipped video save.")
 
 
 if __name__ == "__main__":
