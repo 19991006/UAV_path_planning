@@ -55,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assigner-name", type=str, default="fixed", choices=["hungarian", "greedy", "fixed", "cross"])
     parser.add_argument("--lidar-num-rays", type=int, default=35)
     parser.add_argument("--lidar-range", type=float, default=5.0)
+    parser.add_argument("--layout-mode", type=str, default="same_side",
+                        choices=["same_side", "cross"],
+                        help="Agent/target layout: same_side or cross")
 
     # Training.
     parser.add_argument("--total-updates", type=int, default=1000)
@@ -105,6 +108,7 @@ def make_env(args: argparse.Namespace, seed_offset: int = 0) -> MultiUAV2DEnv:
         assigner_name=args.assigner_name,
         lidar_num_rays=args.lidar_num_rays,
         lidar_range=args.lidar_range,
+        layout_mode=args.layout_mode,
         seed=args.seed + seed_offset,
     )
     return MultiUAV2DEnv(cfg)
