@@ -21,22 +21,36 @@ from mappo import MAPPOAgent, MAPPOConfig
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a trained DA-MAPPO policy.")
-    parser.add_argument("run_dir", type=str, help="Path to the training run directory")
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained DA-MAPPO policy.")
+    parser.add_argument("run_dir", type=str,
+                        help="Path to the training run directory")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--deterministic", action="store_true", default=True)
-    parser.add_argument("--stochastic", dest="deterministic", action="store_false")
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--seed", type=int, default=0, help="Override eval seed (0 = use training seed)")
+    parser.add_argument(
+        "--stochastic", dest="deterministic", action="store_false")
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Override eval seed (0 = use training seed)")
     parser.add_argument("--output-dir", type=str, default="eval_outputs")
+    parser.add_argument("--run-tag", type=str, default=None,
+                        help="Custom tag for output subdirectory (default: use run_dir name)")
     parser.add_argument("--checkpoint", type=str, default="best.pt",
                         help="Checkpoint filename in run_dir/checkpoints/ (default: best.pt)")
     parser.add_argument("--no-plots", action="store_true")
-    parser.add_argument("--show", action="store_true", help="Show plots interactively")
+    parser.add_argument("--show", action="store_true",
+                        help="Show plots interactively")
     parser.add_argument("--num-obstacles", type=int, default=None,
                         help="Override num_obstacles from training config")
-    parser.add_argument("--save-video", action="store_true", help="Save MP4 video of the best episode")
-    parser.add_argument("--video-fps", type=int, default=10, help="FPS for saved video (default: 10)")
+    parser.add_argument("--layout-mode", type=str, default=None,
+                        help="Override layout_mode from training config (e.g. 'same_side', 'cross')")
+    parser.add_argument("--dynamic-targets", type=bool, default=None,
+                        help="Override dynamic_targets from training config (True/False)")
+    parser.add_argument("--save-video", action="store_true",
+                        help="Save MP4 video of the best episode")
+    parser.add_argument("--video-fps", type=int, default=10,
+                        help="FPS for saved video (default: 10)")
     return parser.parse_args()
 
 
@@ -60,16 +74,28 @@ def set_seed(seed: int) -> None:
 
 
 def make_env_from_config(train_args: dict, seed_offset: int = 0,
-                        num_obstacles: int | None = None) -> MultiUAV2DEnv:
+                         num_obstacles: int | None = None,
+                         layout_mode: str | None = None,
+                         dynamic_targets: bool | None = None) -> MultiUAV2DEnv:
     """Build env from saved training config."""
     cfg = UAVEnvConfig(
         num_agents=train_args["num_agents"],
-        num_obstacles=num_obstacles if num_obstacles is not None else train_args["num_obstacles"],
+        num_obstacles=num_obstacles if num_obstacles is not None else train_args[
+            "num_obstacles"],
         max_steps=train_args["max_steps"],
         assigner_name=train_args["assigner_name"],
         lidar_num_rays=train_args["lidar_num_rays"],
         lidar_range=train_args["lidar_range"],
-        layout_mode=train_args.get("layout_mode", "same_side"),
+        layout_mode=(
+            layout_mode
+            if layout_mode is not None else
+            train_args.get("layout_mode", "same_side")
+        ),
+        dynamic_targets=(
+            dynamic_targets
+            if dynamic_targets is not None else
+            train_args.get("dynamic_targets", False)
+        ),
         seed=train_args["seed"] + seed_offset,
     )
     return MultiUAV2DEnv(cfg)
@@ -131,7 +157,8 @@ def run_episode(
 
     reason = info.get("termination_reason", "")
     success = float("success" in reason)
-    collision_or_boundary = float("collision" in reason or "boundary_violation" in reason)
+    collision_or_boundary = float(
+        "collision" in reason or "boundary_violation" in reason)
     timeout = float("timeout" in reason)
 
     metrics = {
@@ -190,7 +217,8 @@ def plot_trajectory(
         ax.add_patch(circle)
 
     # Targets.
-    ax.scatter(target_positions[:, 0], target_positions[:, 1], marker="*", s=180, label="Targets")
+    ax.scatter(target_positions[:, 0], target_positions[:,
+               1], marker="*", s=180, label="Targets")
     for t_id, target in enumerate(target_positions):
         ax.text(target[0], target[1], f"T{t_id}")
 
@@ -201,7 +229,8 @@ def plot_trajectory(
 
         if arrived_history is not None and arrived_history.shape[0] > 0:
             arrived_indices = np.where(arrived_history[:, i])[0]
-            end_idx = int(arrived_indices[0]) if len(arrived_indices) > 0 else full_traj.shape[0] - 1
+            end_idx = int(arrived_indices[0]) if len(
+                arrived_indices) > 0 else full_traj.shape[0] - 1
         else:
             end_idx = full_traj.shape[0] - 1
 
@@ -264,18 +293,23 @@ def animate_trajectory(
     for center, radius in zip(obstacle_centers, obstacle_radii):
         circle = plt.Circle(center, radius, fill=True, alpha=0.45)
         ax.add_patch(circle)
-    ax.scatter(target_positions[:, 0], target_positions[:, 1], marker="*", s=180, label="Targets")
+    ax.scatter(target_positions[:, 0], target_positions[:,
+               1], marker="*", s=180, label="Targets")
     for t_id, target in enumerate(target_positions):
         ax.text(target[0], target[1], f"T{t_id}")
 
     # Animated elements.
-    trail_lines = [ax.plot([], [], linewidth=2, label=f"UAV {i}")[0] for i in range(num_agents)]
+    trail_lines = [ax.plot([], [], linewidth=2, label=f"UAV {i}")[
+        0] for i in range(num_agents)]
     pos_dots = ax.plot([], [], "ko", ms=6)[0]
-    uav_labels = [ax.text(0, 0, f"U{i}", visible=False) for i in range(num_agents)]
-    assign_lines = [ax.plot([], [], "--", linewidth=1, alpha=0.5)[0] for i in range(num_agents)]
+    uav_labels = [ax.text(0, 0, f"U{i}", visible=False)
+                  for i in range(num_agents)]
+    assign_lines = [ax.plot([], [], "--", linewidth=1, alpha=0.5)[0]
+                    for i in range(num_agents)]
     ax.legend(loc="upper left")
 
-    info_text = ax.text(0.98, 0.98, "", transform=ax.transAxes, va="top", ha="right", fontsize=9)
+    info_text = ax.text(0.98, 0.98, "", transform=ax.transAxes,
+                        va="top", ha="right", fontsize=9)
 
     def update(frame: int):
         end = frame + 1
@@ -288,17 +322,26 @@ def animate_trajectory(
             tx, ty = target_positions[final_assignments[i]]
             assign_lines[i].set_data([x, tx], [y, ty])
 
-        pos_dots.set_data(positions_history[end - 1, :, 0], positions_history[end - 1, :, 1])
+        pos_dots.set_data(
+            positions_history[end - 1, :, 0],
+            positions_history[end - 1, :, 1]
+        )
 
         parts = [f"step {end}/{num_steps}"]
         if frame < len(reward_history):
-            parts.append(f"reward mean: {float(np.mean(reward_history[frame])):.3f}")
+            parts.append(
+                f"reward mean: {float(np.mean(reward_history[frame])):.3f}"
+            )
         info_text.set_text("  ".join(parts))
 
         ax.set_title(f"{title}\ntermination: {reason}")
         return trail_lines + [pos_dots] + uav_labels + assign_lines + [info_text]
 
-    ani = FuncAnimation(fig, update, frames=num_steps, interval=1000 // fps, blit=True)
+    ani = FuncAnimation(fig,
+                        update,
+                        frames=num_steps,
+                        interval=1000 // fps,
+                        blit=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # matplotlib may not find ffmpeg automatically; check common conda locations.
@@ -336,7 +379,11 @@ def aggregate_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
 def main() -> None:
     args = parse_args()
     run_dir = Path(args.run_dir)
-    run_tag = args.run_dir.strip("\\").split("\\")[-1]
+    run_tag = (
+        args.run_tag
+        if args.run_tag is not None else
+        args.run_dir.strip("\\").split("\\")[-1]
+    )
     train_args = load_run_config(run_dir)
     print(f"Loaded config from: {run_dir / 'config.json'}")
 
@@ -346,8 +393,15 @@ def main() -> None:
     eval_seed = args.seed if args.seed != 0 else train_args.get("seed", 42)
     set_seed(eval_seed)
 
-    env = make_env_from_config(train_args, seed_offset=0, num_obstacles=args.num_obstacles)
-    agent = load_agent_from_run(env, run_dir, train_args, args.device, args.checkpoint)
+    env = make_env_from_config(
+        train_args,
+        seed_offset=0,
+        num_obstacles=args.num_obstacles,
+        layout_mode=args.layout_mode,
+        dynamic_targets=args.dynamic_targets
+    )
+    agent = load_agent_from_run(
+        env, run_dir, train_args, args.device, args.checkpoint)
 
     print("DA-MAPPO evaluation started")
     print(f"run_dir: {run_dir}")
@@ -385,7 +439,8 @@ def main() -> None:
         )
 
         if not args.no_plots or args.show:
-            plot_path = output_dir / f"trajectory_ep_{ep + 1:03d}.png" if not args.no_plots else None
+            plot_path = output_dir / \
+                f"trajectory_ep_{ep + 1:03d}.png" if not args.no_plots else None
             plot_trajectory(
                 trajectory_data=trajectory_data,
                 env_cfg=env.cfg,
@@ -411,12 +466,15 @@ def main() -> None:
             print(f"  ep={ep + 1:03d}  return_mean={m['episode_return_mean']:.3f}  "
                   f"success={m['success']:.0f}  reason={all_trajectories[ep]['termination_reason']}")
 
-        raw = input("Enter episode numbers to save (e.g. 1,3,5), or press Enter to skip: ").strip()
+        raw = input(
+            "Enter episode numbers to save (e.g. 1,3,5), or press Enter to skip: ").strip()
         if raw:
-            selected = [int(x.strip()) - 1 for x in raw.split(",") if x.strip().isdigit()]
+            selected = [int(x.strip()) - 1 for x in raw.split(",")
+                        if x.strip().isdigit()]
             for idx in selected:
                 if 0 <= idx < args.episodes:
-                    video_path = output_dir / f"trajectory_ep_{idx + 1:03d}.mp4"
+                    video_path = output_dir / \
+                        f"trajectory_ep_{idx + 1:03d}.mp4"
                     print(f"Saving video for episode {idx + 1} ...")
                     animate_trajectory(
                         trajectory_data=all_trajectories[idx],
