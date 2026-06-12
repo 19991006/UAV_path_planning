@@ -41,12 +41,16 @@ class CBBAConfig:
         use_timestamps: If True, use full Table I with timestamp-based freshness checks.
         communication_graph: (N_u, N_u) adjacency matrix. None means fully connected.
         squared_distance: Use squared Euclidean distance for score computation.
+        max_dist_sq: Maximum squared distance between any agent-target pair.
+            Used to convert distances to non-negative rewards. If None, computed
+            automatically from agent/target positions at assign() time.
     """
     L_t: int = 1
     max_iterations: int = 100
     use_timestamps: bool = False
     communication_graph: Optional[np.ndarray] = None
     squared_distance: bool = True
+    max_dist_sq: Optional[float] = None
 
 
 class BaseTargetAssigner(ABC):
@@ -289,11 +293,13 @@ class CBBAAgent:
         position: np.ndarray,
         target_positions: np.ndarray,
         config: CBBAConfig,
+        max_dist_sq: Optional[float] = None,
     ):
         self.agent_id = agent_id
         self.position = position.astype(np.float32)
         self.targets = target_positions.astype(np.float32)
         self.cfg = config
+        self.max_dist_sq = max_dist_sq
 
         self.num_targets = target_positions.shape[0]
         self.num_agents_for_s = 0  # set externally after initialization
@@ -312,7 +318,11 @@ class CBBAAgent:
         return float(np.sum((a - b) ** 2))
 
     def _path_score(self, path: list[int]) -> float:
-        """S_i^{p_i}: total score along a path = -sum of squared distances."""
+        """S_i^{p_i}: total reward along a path = sum (max_dist_sq - dist_sq).
+
+        Converts distances to non-negative rewards so that CBBA marginal gains
+        (Equation 3) are always >= 0 as required by c_ij >= 0 in the paper.
+        """
         if not path:
             return 0.0
         score = 0.0
@@ -320,7 +330,10 @@ class CBBAAgent:
         for task_id in path:
             target = self.targets[task_id]
             dist_sq = self._distance_sq(prev, target)
-            score -= dist_sq if self.cfg.squared_distance else float(np.sqrt(dist_sq + 1e-8))
+            if self.cfg.squared_distance:
+                score += self.max_dist_sq - dist_sq
+            else:
+                score += self.max_dist_sq - float(np.sqrt(dist_sq + 1e-8))
             prev = target
         return score
 
@@ -566,9 +579,15 @@ class CBBATargetAssigner(BaseTargetAssigner):
         num_agents = agent_positions.shape[0]
         num_targets = target_positions.shape[0]
 
+        # Compute max_dist_sq for reward normalization if not provided
+        max_dist_sq = self.cfg.max_dist_sq
+        if max_dist_sq is None:
+            diff = agent_positions[:, None, :] - target_positions[None, :, :]
+            max_dist_sq = float(np.max(np.sum(diff ** 2, axis=-1)))
+
         # 1. Initialize agents
         agents = [
-            CBBAAgent(i, agent_positions[i], target_positions, self.cfg)
+            CBBAAgent(i, agent_positions[i], target_positions, self.cfg, max_dist_sq)
             for i in range(num_agents)
         ]
 
