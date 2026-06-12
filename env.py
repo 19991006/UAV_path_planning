@@ -99,7 +99,7 @@ class UAVEnvConfig:
     # obstacle_area_x_max: float = 5.0
     # obstacle_area_y_min: float = -8.0
     # obstacle_area_y_max: float = 8.0
-    # min_obstacle_spacing: float = 0.8
+    min_obstacle_spacing: float = 0.8
 
     # Collision / safety settings.
     uav_radius: float = 0.20
