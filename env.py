@@ -44,6 +44,7 @@ class UAVEnvConfig:
 
     # Action bounds.
     max_linear_velocity: float = 1.0
+    min_linear_velocity: float = -0.3
     max_angular_velocity: float = 1.0
 
     # Initial UAV layout.
@@ -382,11 +383,16 @@ class MultiUAV2DEnv:
         return self._get_obs(), rewards, dones, info
 
     def _apply_actions(self, actions: np.ndarray) -> None:
-        """Apply clipped velocity commands using unicycle-style 2D kinematics."""
+        """Apply remapped velocity commands using unicycle-style 2D kinematics."""
         self.previous_linear_velocities = self.linear_velocities.copy()
         self.previous_angular_velocities = self.angular_velocities.copy()
 
-        v_cmd = np.clip(actions[:, 0], -self.cfg.max_linear_velocity, self.cfg.max_linear_velocity)
+        v_raw = actions[:, 0]
+        v_cmd = np.where(
+            v_raw >= 0,
+            v_raw * self.cfg.max_linear_velocity,
+            v_raw * abs(self.cfg.min_linear_velocity),
+        )
         omega_cmd = np.clip(actions[:, 1], -self.cfg.max_angular_velocity, self.cfg.max_angular_velocity)
 
         if self.cfg.freeze_arrived_uavs:
@@ -677,7 +683,12 @@ class MultiUAV2DEnv:
         max_linear_acc = max(self.cfg.max_linear_velocity / self.cfg.dt, 1e-6)
         max_angular_acc = max(self.cfg.max_angular_velocity / self.cfg.dt, 1e-6)
 
-        v_norm = self.linear_velocities / self.cfg.max_linear_velocity
+        v_scale = np.where(
+            self.linear_velocities >= 0,
+            self.cfg.max_linear_velocity,
+            abs(self.cfg.min_linear_velocity),
+        )
+        v_norm = self.linear_velocities / np.maximum(v_scale, 1e-6)
         omega_norm = self.angular_velocities / self.cfg.max_angular_velocity
         a_v_norm = np.clip(self.linear_accelerations / max_linear_acc, -1.0, 1.0)
         a_omega_norm = np.clip(self.angular_accelerations / max_angular_acc, -1.0, 1.0)
@@ -815,7 +826,11 @@ class MultiUAV2DEnv:
                 self.positions.reshape(-1) / half_world,
                 np.cos(self.headings),
                 np.sin(self.headings),
-                self.linear_velocities / self.cfg.max_linear_velocity,
+                np.where(
+                    self.linear_velocities >= 0,
+                    self.linear_velocities / self.cfg.max_linear_velocity,
+                    self.linear_velocities / abs(self.cfg.min_linear_velocity),
+                ),
                 self.angular_velocities / self.cfg.max_angular_velocity,
                 np.clip(self.linear_accelerations / max_linear_acc, -1.0, 1.0),
                 np.clip(self.angular_accelerations / max_angular_acc, -1.0, 1.0),
