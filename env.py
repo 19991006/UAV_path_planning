@@ -84,7 +84,7 @@ class UAVEnvConfig:
     lidar_fov: float = 2.0 * np.pi
 
     # Communication / topology observation.
-    communication_range: float = 10.0
+    communication_range: float = 5.0
     use_communication_range_mask: bool = False
 
     # Obstacle settings.
@@ -524,11 +524,17 @@ class MultiUAV2DEnv:
 
     def _update_assignments(self) -> None:
         """Update agent-target assignment through the pluggable assignment module."""
+        dists = np.linalg.norm(
+            self.positions[:, None, :] - self.positions[None, :, :], axis=-1
+        )
+        comm_adj = (dists <= self.cfg.communication_range) & ~np.eye(self.num_agents, dtype=bool)
+
         assignments, cost_matrix, assign_info = self.target_assigner.assign(
             agent_positions=self.positions.copy(),
             target_positions=self.target_positions.copy(),
             step_count=self.step_count,
             arrived=self.arrived.copy(),
+            communication_graph=comm_adj,
         )
 
         assignments = np.asarray(assignments, dtype=np.int64)

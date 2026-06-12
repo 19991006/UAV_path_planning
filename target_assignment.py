@@ -596,9 +596,11 @@ class CBBATargetAssigner(BaseTargetAssigner):
             agent.num_agents_for_s = num_agents
             agent.s = np.zeros(num_agents, dtype=np.float32)
 
-        # Build communication graph
+        # Build communication graph: config > kwargs > fully-connected default
         if self.cfg.communication_graph is not None:
             adj = np.asarray(self.cfg.communication_graph)
+        elif "communication_graph" in kwargs and kwargs["communication_graph"] is not None:
+            adj = np.asarray(kwargs["communication_graph"])
         else:
             adj = np.ones((num_agents, num_agents), dtype=bool)
             np.fill_diagonal(adj, False)
