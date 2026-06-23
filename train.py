@@ -21,6 +21,7 @@ import argparse
 import csv
 import json
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Dict
@@ -35,65 +36,113 @@ from gnn_mappo import GraphMAPPOAgent
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train DA-MAPPO on the multi-UAV target assignment environment.")
-
-    # General.
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--run-name", type=str, default="mappo")
-    parser.add_argument("--save-dir", type=str, default="runs")
-    parser.add_argument(
-        "--resume-checkpoint",
-        type=str,
-        default=None,
-        help="Path to checkpoint for continuing training."
+    parser = argparse.ArgumentParser(
+        description="Train DA-MAPPO on the multi-UAV target assignment environment.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # General.
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda"],
+                        help="Torch device: auto selects CUDA if available, else CPU")
+    parser.add_argument("--run-name", type=str, default="mappo",
+                        help="Short identifier for this run (used in output directory name)")
+    parser.add_argument("--save-dir", type=str, default="runs",
+                        help="Parent directory for all run outputs")
+    parser.add_argument("--resume-checkpoint", type=str, default=None,
+                        help="Path to checkpoint.pt for resuming training")
+
     # Environment.
-    parser.add_argument("--num-agents", type=int, default=3)
-    parser.add_argument("--num-obstacles", type=int, default=20)
-    parser.add_argument("--max-steps", type=int, default=600)
+    parser.add_argument("--num-agents", type=int, default=3,
+                        help="Number of UAVs (target count always equals agent count)")
+    parser.add_argument("--num-obstacles", type=int, default=20,
+                        help="Number of circular obstacles placed in the arena")
+    parser.add_argument("--max-steps", type=int, default=600,
+                        help="Max environment steps per episode before timeout")
     parser.add_argument("--assigner-name", type=str, default="fixed",
-                        choices=["hungarian", "greedy", "fixed", "cross", "cbba"])
-    parser.add_argument("--lidar-num-rays", type=int, default=35)
-    parser.add_argument("--lidar-range", type=float, default=5.0)
+                        choices=["hungarian", "greedy", "fixed", "cross", "cbba"],
+                        help="Online target assignment algorithm")
+    parser.add_argument("--lidar-num-rays", type=int, default=35,
+                        help="Number of LiDAR rays per UAV for obstacle sensing")
+    parser.add_argument("--lidar-range", type=float, default=5.0,
+                        help="Maximum LiDAR detection range (meters)")
     parser.add_argument("--layout-mode", type=str, default="same_side",
                         choices=["same_side", "cross"],
-                        help="Agent/target layout: same_side or cross")
+                        help="Initial layout of agent and target spawn regions")
+
+    # Dynamic targets.
+    parser.add_argument("--dynamic-targets", action="store_true", default=False,
+                        help="Enable dynamic target motion")
+    parser.add_argument("--target-motion-mode", type=str, default="none",
+                        choices=["none", "swap", "linear", "linear_swap", "racetrack"],
+                        help="Target motion mode")
+    parser.add_argument("--target-speed", type=float, default=0.2,
+                        help="Target movement speed for linear motion (m/s)")
+    parser.add_argument("--racetrack-turn-radius", type=float, default=0.5,
+                        help="Racetrack U-turn arc radius")
+    parser.add_argument("--racetrack-straight-half-length", type=float, default=9.0,
+                        help="Racetrack straight segment half-length")
+    parser.add_argument("--racetrack-front-speed", type=float, default=0.2,
+                        help="Racetrack speed on front (left) side (m/s)")
+    parser.add_argument("--racetrack-back-speed", type=float, default=2.0,
+                        help="Racetrack speed on back (right) side (m/s)")
 
     # Training.
-    parser.add_argument("--total-updates", type=int, default=1000)
-    parser.add_argument("--rollout-steps", type=int, default=512)
-    parser.add_argument("--ppo-epochs", type=int, default=10)
-    parser.add_argument("--minibatch-size", type=int, default=64)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
-    parser.add_argument("--actor-lr", type=float, default=3e-5)
-    parser.add_argument("--critic-lr", type=float, default=3e-4)
-    parser.add_argument("--clip-coef", type=float, default=0.2)
-    parser.add_argument("--entropy-coef", type=float, default=0.01)
-    parser.add_argument("--value-loss-coef", type=float, default=0.5)
+    parser.add_argument("--total-updates", type=int, default=1000,
+                        help="Number of PPO update iterations to run")
+    parser.add_argument("--rollout-steps", type=int, default=512,
+                        help="Environment steps collected per rollout before each update")
+    parser.add_argument("--ppo-epochs", type=int, default=10,
+                        help="Number of PPO epochs per update (K in the paper)")
+    parser.add_argument("--minibatch-size", type=int, default=64,
+                        help="Minibatch size for PPO gradient steps")
+    parser.add_argument("--gamma", type=float, default=0.99,
+                        help="Discount factor for cumulative return")
+    parser.add_argument("--gae-lambda", type=float, default=0.95,
+                        help="GAE trace-decay parameter for advantage estimation")
+    parser.add_argument("--actor-lr", type=float, default=3e-5,
+                        help="Learning rate for the actor network")
+    parser.add_argument("--critic-lr", type=float, default=3e-4,
+                        help="Learning rate for the critic network")
+    parser.add_argument("--clip-coef", type=float, default=0.2,
+                        help="PPO surrogate objective clipping epsilon")
+    parser.add_argument("--entropy-coef", type=float, default=0.01,
+                        help="Entropy bonus coefficient for exploration")
+    parser.add_argument("--value-loss-coef", type=float, default=0.5,
+                        help="Weight of the value loss in the combined PPO loss")
     parser.add_argument("--target-kl", type=float, default=0.02,
-                        help="Early stop PPO epoch if mean KL exceeds this (0 = disabled)")
-    parser.add_argument("--max-grad-norm", type=float, default=0.5)
+                        help="Early-stop PPO epoch if mean KL exceeds this (0 = disabled)")
+    parser.add_argument("--max-grad-norm", type=float, default=0.5,
+                        help="Maximum gradient norm for gradient clipping")
 
     # Network.
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--num-hidden-layers", type=int, default=2)
-    parser.add_argument("--activation", type=str, default="relu", choices=["tanh", "relu", "gelu", "elu"])
+    parser.add_argument("--hidden-dim", type=int, default=128,
+                        help="Hidden layer dimension in actor/critic MLPs (or GNN node embedding dim)")
+    parser.add_argument("--num-hidden-layers", type=int, default=2,
+                        help="Number of hidden layers (or GNN message-passing rounds)")
+    parser.add_argument("--activation", type=str, default="relu",
+                        choices=["tanh", "relu", "gelu", "elu"],
+                        help="Activation function for hidden layers")
 
     # GNN.
     parser.add_argument("--use-gnn", action="store_true", default=False,
-                        help="Use GNN MAPPO agent (agent-count generalizable)")
+                        help="Use GNN MAPPO agent instead of MLP (agent-count generalizable)")
     parser.add_argument("--torch-num-threads", type=int, default=1,
-                        help="Set torch CPU threads (default 1 avoids oversubscription on small GNN batches)")
+                        help="Torch CPU thread count (1 avoids oversubscription on small GNN batches)")
 
     # Logging / saving / evaluation.
-    parser.add_argument("--log-interval", type=int, default=1)
-    parser.add_argument("--eval-interval", type=int, default=100)
-    parser.add_argument("--save-interval", type=int, default=100)
-    parser.add_argument("--eval-episodes", type=int, default=5)
-    parser.add_argument("--deterministic-eval", action="store_true", default=True)
+    parser.add_argument("--log-interval", type=int, default=1,
+                        help="Log training metrics to CSV and TensorBoard every N updates")
+    parser.add_argument("--eval-interval", type=int, default=100,
+                        help="Run deterministic evaluation every N updates (0 = skip)")
+    parser.add_argument("--save-interval", type=int, default=100,
+                        help="Save periodic checkpoints every N updates")
+    parser.add_argument("--eval-episodes", type=int, default=5,
+                        help="Number of episodes per evaluation run")
+    parser.add_argument("--deterministic-eval", action="store_true", default=True,
+                        help="Use deterministic action selection during evaluation")
 
 
 
@@ -117,6 +166,13 @@ def make_env(args: argparse.Namespace, seed_offset: int = 0, num_agents: int | N
         lidar_num_rays=args.lidar_num_rays,
         lidar_range=args.lidar_range,
         layout_mode=args.layout_mode,
+        dynamic_targets=args.dynamic_targets,
+        target_motion_mode=args.target_motion_mode,
+        target_speed=args.target_speed,
+        racetrack_turn_radius=args.racetrack_turn_radius,
+        racetrack_straight_half_length=args.racetrack_straight_half_length,
+        racetrack_front_speed=args.racetrack_front_speed,
+        racetrack_back_speed=args.racetrack_back_speed,
         seed=args.seed + seed_offset,
     )
     return MultiUAV2DEnv(cfg)
@@ -237,7 +293,8 @@ def main() -> None:
     set_seed(args.seed)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    tag = f"{args.run_name}_N{args.num_agents}_O{args.num_obstacles}_{args.assigner_name}_S{args.seed}_{timestamp}"
+    policy = "GNN" if args.use_gnn else "MLP"
+    tag = f"{timestamp}_{policy}_N{args.num_agents}_O{args.num_obstacles}_{args.assigner_name}_S{args.seed}_{args.run_name}"
     run_dir = Path(args.save_dir) / tag
     checkpoint_dir = run_dir / "checkpoints"
     csv_path = run_dir / "metrics.csv"
@@ -245,8 +302,10 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     config_path = run_dir / "config.json"
+    config = vars(args)
+    config["cli_command"] = "python " + " ".join(sys.argv)
     with open(config_path, "w") as f:
-        json.dump(vars(args), f, indent=2)
+        json.dump(config, f, indent=2)
     print(f"Config saved to: {config_path}")
 
     if args.torch_num_threads and args.torch_num_threads > 0:

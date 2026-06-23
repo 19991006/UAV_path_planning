@@ -65,7 +65,8 @@ class UAVEnvConfig:
     #   "none"        : static targets;
     #   "swap"        : periodically permute target positions;
     #   "linear"      : targets move with bouncing linear velocities;
-    #   "linear_swap" : both linear motion and periodic swapping.
+    #   "linear_swap" : both linear motion and periodic swapping;
+    #   "racetrack"   : stadium-shaped track, slow on left (front) / fast on right (back).
     dynamic_targets: bool = False
     target_motion_mode: str = "none"
     target_swap_interval: int = 100
@@ -75,6 +76,14 @@ class UAVEnvConfig:
     target_area_x_max: float = 9.0
     target_area_y_min: float = -8.0
     target_area_y_max: float = 8.0
+
+    # Racetrack target motion.
+    # Track is a vertical stadium: left side at target_x (front, slow),
+    # right side at target_x + 2*R (back, fast), U-turn arcs at top/bottom.
+    racetrack_turn_radius: float = 0.5
+    racetrack_straight_half_length: float = 9.0
+    racetrack_front_speed: float = 0.2
+    racetrack_back_speed: float = 2.0
 
     # Assignment settings. Options: "hungarian", "greedy", "fixed".
     assigner_name: str = "hungarian"
@@ -146,6 +155,8 @@ class UAVEnvConfig:
         self.obstacle_area_y_max *= scale_factor
         self.target_area_x_min *= scale_factor
         self.target_area_x_max *= scale_factor
+        self.racetrack_turn_radius *= scale_factor
+        self.racetrack_straight_half_length *= scale_factor
 
 
 class MultiUAV2DEnv:
@@ -448,6 +459,11 @@ class MultiUAV2DEnv:
             self.target_velocities[:, 0] = self.cfg.target_speed * np.cos(angles)
             self.target_velocities[:, 1] = self.cfg.target_speed * np.sin(angles)
 
+        if self.cfg.dynamic_targets and "racetrack" in mode:
+            if not hasattr(self, "_racetrack_s"):
+                self._racetrack_s = np.zeros(self.num_targets, dtype=np.float64)
+            self._init_racetrack_positions()
+
     def _reset_layout_cross(self) -> None:
         """Cross layout: interleave agents and targets on both sides.
 
@@ -493,6 +509,9 @@ class MultiUAV2DEnv:
         if "linear" in mode:
             self._move_targets_linearly_with_bounce()
 
+        if "racetrack" in mode:
+            self._move_targets_racetrack()
+
         if "swap" in mode:
             if self.step_count < self.cfg.target_swap_start_step:
                 return
@@ -533,6 +552,135 @@ class MultiUAV2DEnv:
 
         self.target_positions = self.target_positions[permutation].copy()
         self.target_velocities = self.target_velocities[permutation].copy()
+
+    def _move_targets_racetrack(self) -> None:
+        """Move targets along a vertical stadium-shaped track.
+
+        Track geometry (clockwise):
+          Segment 0 — left vertical ↑  (front, slow): x = target_x
+          Segment 1 — top arc, left→right through top (slow)
+          Segment 2 — right vertical ↓ (back, fast): x = target_x + 2*R
+          Segment 3 — bottom arc, right→left through bottom (slow)
+
+        Arc-length is tracked per-target in self._racetrack_s (initialised
+        lazily on first call). Different speeds are used for front vs back
+        sides, so most targets stay on the front (visible) side.
+        """
+        if not hasattr(self, "_racetrack_s"):
+            self._racetrack_s = np.zeros(self.num_targets, dtype=np.float64)
+            self._init_racetrack_positions()
+            return  # _init_racetrack_positions already set positions and velocities
+
+        R = self.cfg.racetrack_turn_radius
+        L = self.cfg.racetrack_straight_half_length
+        straight_len = 2.0 * L
+        arc_len = np.pi * R
+        total_len = 2.0 * straight_len + 2.0 * arc_len  # 4L + 2πR
+
+        seg_boundaries = np.array([
+            0.0,                     # seg 0 start (left vertical ↑)
+            straight_len,            # seg 1 start (top arc)
+            straight_len + arc_len,  # seg 2 start (right vertical ↓)
+            straight_len + arc_len + straight_len,  # seg 3 start (bottom arc)
+            total_len,               # end
+        ])
+
+        for i in range(self.num_targets):
+            s = self._racetrack_s[i]
+
+            # Determine segment and set segment speed.
+            if s < seg_boundaries[1]:
+                # Segment 0: left vertical ↑ (front, slow)
+                speed = self.cfg.racetrack_front_speed
+            elif s < seg_boundaries[2]:
+                # Segment 1: top arc (slow)
+                speed = self.cfg.racetrack_back_speed
+            elif s < seg_boundaries[3]:
+                # Segment 2: right vertical ↓ (back, fast)
+                speed = self.cfg.racetrack_back_speed
+            else:
+                # Segment 3: bottom arc (slow)
+                speed = self.cfg.racetrack_back_speed
+
+            s += speed * self.cfg.dt
+            if s >= total_len:
+                s -= total_len
+
+            self._racetrack_s[i] = s
+            (x, y), (tx, ty) = self._racetrack_s_to_position(s)
+            self.target_positions[i, 0] = x
+            self.target_positions[i, 1] = y
+            self.target_velocities[i, 0] = speed * tx
+            self.target_velocities[i, 1] = speed * ty
+
+    def _init_racetrack_positions(self) -> None:
+        """Place targets on the left vertical, matching the standard layout.
+
+        Uses target_y_gap (same as static / linear modes) and centres the
+        formation vertically so that target spacing is consistent across
+        motion modes. If the formation exceeds the straight segment, it
+        is clipped to [-L, L].
+        """
+        L = self.cfg.racetrack_straight_half_length
+        center = (self.num_targets - 1) / 2.0
+        for i in range(self.num_targets):
+            y = (i - center) * self.cfg.target_y_gap
+            y = float(np.clip(y, -L, L))
+            self.target_positions[i, 0] = self.cfg.target_x
+            self.target_positions[i, 1] = y
+            # Left vertical: arc-length s goes from 0 (y=-L) to 2L (y=+L).
+            self._racetrack_s[i] = y + L
+            self.target_velocities[i, 0] = 0.0
+            self.target_velocities[i, 1] = self.cfg.racetrack_front_speed
+
+    def _racetrack_s_to_position(self, s: float):
+        """Map arc-length s to (x, y) and unit tangent (tx, ty) on the stadium.
+
+        Track layout (clockwise):
+          Segment 0: left vertical ↑,  s ∈ [0, 2L)
+          Segment 1: top arc →,       s ∈ [2L, 2L+πR)
+          Segment 2: right vertical ↓, s ∈ [2L+πR, 4L+πR)
+          Segment 3: bottom arc ←,    s ∈ [4L+πR, 4L+2πR)
+        """
+        R = self.cfg.racetrack_turn_radius
+        L = self.cfg.racetrack_straight_half_length
+        straight_len = 2.0 * L
+        arc_len = np.pi * R
+        total_len = 2.0 * straight_len + 2.0 * arc_len
+
+        # Wrap s into [0, total_len).
+        s = s % total_len
+
+        cx = self.cfg.target_x + R  # left vertical at x = target_x
+
+        if s < straight_len:
+            # Segment 0: left vertical ↑
+            s_local = s
+            x = cx - R
+            y = -L + s_local
+            tx, ty = 0.0, 1.0
+        elif s < straight_len + arc_len:
+            # Segment 1: top arc (left → right through top)
+            s_local = s - straight_len
+            alpha = np.pi - s_local / R  # π → 0 (clockwise through top)
+            x = cx + R * np.cos(alpha)
+            y = L + R * np.sin(alpha)
+            tx, ty = float(np.sin(alpha)), float(-np.cos(alpha))
+        elif s < 2.0 * straight_len + arc_len:
+            # Segment 2: right vertical ↓
+            s_local = s - straight_len - arc_len
+            x = cx + R
+            y = L - s_local
+            tx, ty = 0.0, -1.0
+        else:
+            # Segment 3: bottom arc (right → left through bottom)
+            s_local = s - 2.0 * straight_len - arc_len
+            alpha = -s_local / R  # 0 → -π (clockwise through bottom)
+            x = cx + R * np.cos(alpha)
+            y = -L + R * np.sin(alpha)
+            tx, ty = float(np.sin(alpha)), float(-np.cos(alpha))
+
+        return (x, y), (tx, ty)
 
     def _update_assignments(self) -> None:
         """Update agent-target assignment through the pluggable assignment module."""

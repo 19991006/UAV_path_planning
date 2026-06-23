@@ -48,6 +48,16 @@ def parse_args() -> argparse.Namespace:
                         help="Override layout_mode from training config (e.g. 'same_side', 'cross')")
     parser.add_argument("--dynamic-targets", type=bool, default=None,
                         help="Override dynamic_targets from training config (True/False)")
+    parser.add_argument("--target-motion-mode", type=str, default=None,
+                        help="Override target_motion_mode from training config")
+    parser.add_argument("--racetrack-turn-radius", type=float, default=None,
+                        help="Override racetrack_turn_radius")
+    parser.add_argument("--racetrack-straight-half-length", type=float, default=None,
+                        help="Override racetrack_straight_half_length")
+    parser.add_argument("--racetrack-front-speed", type=float, default=None,
+                        help="Override racetrack_front_speed")
+    parser.add_argument("--racetrack-back-speed", type=float, default=None,
+                        help="Override racetrack_back_speed")
     parser.add_argument("--save-video", action="store_true",
                         help="Save MP4 video of the best episode")
     parser.add_argument("--video-fps", type=int, default=10,
@@ -86,6 +96,11 @@ def make_env_from_config(train_args: dict, seed_offset: int = 0,
                          num_obstacles: int | None = None,
                          layout_mode: str | None = None,
                          dynamic_targets: bool | None = None,
+                         target_motion_mode: str | None = None,
+                         racetrack_turn_radius: float | None = None,
+                         racetrack_straight_half_length: float | None = None,
+                         racetrack_front_speed: float | None = None,
+                         racetrack_back_speed: float | None = None,
                          eval_num_agents: int | None = None) -> MultiUAV2DEnv:
     """Build env from saved training config."""
     cfg = UAVEnvConfig(
@@ -105,6 +120,32 @@ def make_env_from_config(train_args: dict, seed_offset: int = 0,
             dynamic_targets
             if dynamic_targets is not None else
             train_args.get("dynamic_targets", False)
+        ),
+        target_motion_mode=(
+            target_motion_mode
+            if target_motion_mode is not None else
+            train_args.get("target_motion_mode", "none")
+        ),
+        target_speed=train_args.get("target_speed", 0.2),
+        racetrack_turn_radius=(
+            racetrack_turn_radius
+            if racetrack_turn_radius is not None else
+            train_args.get("racetrack_turn_radius", 0.5)
+        ),
+        racetrack_straight_half_length=(
+            racetrack_straight_half_length
+            if racetrack_straight_half_length is not None else
+            train_args.get("racetrack_straight_half_length", 9.0)
+        ),
+        racetrack_front_speed=(
+            racetrack_front_speed
+            if racetrack_front_speed is not None else
+            train_args.get("racetrack_front_speed", 0.2)
+        ),
+        racetrack_back_speed=(
+            racetrack_back_speed
+            if racetrack_back_speed is not None else
+            train_args.get("racetrack_back_speed", 2.0)
         ),
         seed=train_args["seed"] + seed_offset,
     )
@@ -148,6 +189,7 @@ def run_episode(
     done = False
 
     positions_history: List[np.ndarray] = [env.positions.copy()]
+    target_positions_history: List[np.ndarray] = [env.target_positions.copy()]
     assignments_history: List[np.ndarray] = [env.assignments.copy()]
     arrived_history: List[np.ndarray] = [env.arrived.copy()]
     reward_history: List[np.ndarray] = []
@@ -164,6 +206,7 @@ def run_episode(
         episode_length += 1
         reward_history.append(rewards.copy())
         positions_history.append(env.positions.copy())
+        target_positions_history.append(env.target_positions.copy())
         assignments_history.append(env.assignments.copy())
         arrived_history.append(env.arrived.copy())
 
@@ -186,6 +229,7 @@ def run_episode(
 
     trajectory_data = {
         "positions_history": np.asarray(positions_history, dtype=np.float32),
+        "target_positions_history": np.asarray(target_positions_history, dtype=np.float32),
         "assignments_history": np.asarray(assignments_history, dtype=np.int64),
         "arrived_history": np.asarray(arrived_history, dtype=bool),
         "reward_history": np.asarray(reward_history, dtype=np.float32),
@@ -230,7 +274,13 @@ def plot_trajectory(
         circle = plt.Circle(center, radius, fill=True, alpha=0.45)
         ax.add_patch(circle)
 
-    # Targets.
+    # Targets (final positions + trajectory if available).
+    target_positions_history = trajectory_data.get("target_positions_history")
+    if target_positions_history is not None:
+        for i in range(target_positions.shape[0]):
+            t_traj = target_positions_history[:, i, :]
+            ax.plot(t_traj[:, 0], t_traj[:, 1], linewidth=0.5, alpha=0.4)
+            ax.scatter(t_traj[0, 0], t_traj[0, 1], marker="s", s=40)
     ax.scatter(target_positions[:, 0], target_positions[:,
                1], marker="*", s=180, label="Targets")
     for t_id, target in enumerate(target_positions):
@@ -286,10 +336,16 @@ def animate_trajectory(
     from matplotlib.animation import FuncAnimation, writers
 
     positions_history = trajectory_data["positions_history"]
-    target_positions = trajectory_data["target_positions"]
+    target_positions_history = trajectory_data.get(
+        "target_positions_history",
+        np.tile(trajectory_data["target_positions"], (positions_history.shape[0], 1, 1)),
+    )
     obstacle_centers = trajectory_data["obstacle_centers"]
     obstacle_radii = trajectory_data["obstacle_radii"]
-    final_assignments = trajectory_data["final_assignments"]
+    assignments_history = trajectory_data.get("assignments_history")
+    if assignments_history is None:
+        assignments_history = np.tile(
+            trajectory_data["final_assignments"], (positions_history.shape[0], 1))
     reward_history = trajectory_data["reward_history"]
     reason = trajectory_data["termination_reason"]
 
@@ -307,12 +363,11 @@ def animate_trajectory(
     for center, radius in zip(obstacle_centers, obstacle_radii):
         circle = plt.Circle(center, radius, fill=True, alpha=0.45)
         ax.add_patch(circle)
-    ax.scatter(target_positions[:, 0], target_positions[:,
-               1], marker="*", s=180, label="Targets")
-    for t_id, target in enumerate(target_positions):
-        ax.text(target[0], target[1], f"T{t_id}")
 
     # Animated elements.
+    target_scatter = ax.scatter([], [], marker="*", s=180, label="Targets")
+    target_labels = [ax.text(0, 0, f"T{i}", visible=False)
+                     for i in range(num_agents)]
     trail_lines = [ax.plot([], [], linewidth=2, label=f"UAV {i}")[
         0] for i in range(num_agents)]
     pos_dots = ax.plot([], [], "ko", ms=6)[0]
@@ -327,13 +382,20 @@ def animate_trajectory(
 
     def update(frame: int):
         end = frame + 1
+        # Animate targets
+        t_pos = target_positions_history[end - 1]
+        target_scatter.set_offsets(t_pos)
+        for i in range(num_agents):
+            target_labels[i].set_position((t_pos[i, 0], t_pos[i, 1]))
+            target_labels[i].set_visible(True)
+
         for i in range(num_agents):
             traj = positions_history[:end, i, :]
             trail_lines[i].set_data(traj[:, 0], traj[:, 1])
             x, y = positions_history[end - 1, i]
             uav_labels[i].set_position((x, y))
             uav_labels[i].set_visible(True)
-            tx, ty = target_positions[final_assignments[i]]
+            tx, ty = t_pos[assignments_history[end - 1, i]]
             assign_lines[i].set_data([x, tx], [y, ty])
 
         pos_dots.set_data(
@@ -349,7 +411,8 @@ def animate_trajectory(
         info_text.set_text("  ".join(parts))
 
         ax.set_title(f"{title}\ntermination: {reason}")
-        return trail_lines + [pos_dots] + uav_labels + assign_lines + [info_text]
+        return ([target_scatter] + trail_lines + [pos_dots] + target_labels +
+                uav_labels + assign_lines + [info_text])
 
     ani = FuncAnimation(fig,
                         update,
@@ -418,6 +481,11 @@ def main() -> None:
         num_obstacles=args.num_obstacles,
         layout_mode=args.layout_mode,
         dynamic_targets=args.dynamic_targets,
+        target_motion_mode=args.target_motion_mode,
+        racetrack_turn_radius=args.racetrack_turn_radius,
+        racetrack_straight_half_length=args.racetrack_straight_half_length,
+        racetrack_front_speed=args.racetrack_front_speed,
+        racetrack_back_speed=args.racetrack_back_speed,
         eval_num_agents=args.eval_num_agents,
     )
     agent = load_agent_from_run(
@@ -433,6 +501,7 @@ def main() -> None:
     print(f"num_agents: {env.num_agents}")
     print(f"num_obstacles: {train_args['num_obstacles']}")
     print(f"assigner: {train_args['assigner_name']}")
+    print(f"dynamic_targets: {env.cfg.dynamic_targets}  mode: {env.cfg.target_motion_mode}")
     if use_gnn:
         print(f"node_dim: {agent.node_dim}")
         print(f"edge_dim: {agent.edge_dim}")

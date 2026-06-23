@@ -46,7 +46,7 @@ class CBBAConfig:
             automatically from agent/target positions at assign() time.
     """
     L_t: int = 1
-    max_iterations: int = 100
+    max_iterations: int = 500
     use_timestamps: bool = False
     communication_graph: Optional[np.ndarray] = None
     squared_distance: bool = True
@@ -612,60 +612,114 @@ class CBBATargetAssigner(BaseTargetAssigner):
             for agent in agents:
                 agent.build_bundle()
 
-            # Phase 2: Consensus
-            for i in range(num_agents):
-                for k in range(num_agents):
-                    if i == k or not adj[i, k]:
+            if self.cfg.L_t == 1 and not self.cfg.use_timestamps:
+                # CBAA Phase 2 — Algorithm 2 from Choi et al. (2009).
+                #
+                # Line 3-4: y_ij = max_{k: adj[i,k] or k==i} y_kj   ∀j
+                # Line 5-8: z_i,J_i = argmax_k (y_k,J_i); release if z_i ≠ i.
+                #
+                # Snapshot all y vectors first so that the winner check uses
+                # Phase-1 values, not values already updated by max-consensus.
+
+                # --- Snapshot ---
+                y_snapshot = [a.y.copy() for a in agents]
+
+                # --- Max-consensus (Line 3-4) ---
+                for i in range(num_agents):
+                    best = y_snapshot[i].copy()
+                    for k in range(num_agents):
+                        if adj[i, k]:
+                            best = np.maximum(best, y_snapshot[k])
+                    agents[i].y = best
+
+                # --- Winner check (Lines 5-8) using snapshot ---
+                for i in range(num_agents):
+                    if not agents[i].b:
                         continue
-                    agents[i].receive_from(agents[k])
-                    if self.cfg.use_timestamps:
-                        agents[i].update_timestamp(k, float(iteration))
+                    task_j = agents[i].b[0]
 
-            # Cascading release
-            for agent in agents:
-                agent.cascade_release()
+                    best_agent = i
+                    best_bid = y_snapshot[i][task_j]
+                    for k in range(num_agents):
+                        if not adj[i, k]:
+                            continue
+                        if y_snapshot[k][task_j] > best_bid:
+                            best_bid = y_snapshot[k][task_j]
+                            best_agent = k
 
-            # Check convergence
-            if self._is_converged(agents, num_agents):
-                break
+                    if best_agent != i:
+                        agents[i].y[task_j] = 0.0
+                        agents[i].z[task_j] = -1
+                        agents[i].b = []
+                        agents[i].p = []
+                        agents[i].total_score = 0.0
 
-        # 3. Build output
+                # Convergence: all agents assigned and no duplicate task claims.
+                if self._is_converged_cbaa(agents, num_agents):
+                    break
+            else:
+                # CBBA Phase 2 — Table I pairwise consensus.
+                for i in range(num_agents):
+                    for k in range(num_agents):
+                        if i == k or not adj[i, k]:
+                            continue
+                        agents[i].receive_from(agents[k])
+                        if self.cfg.use_timestamps:
+                            agents[i].update_timestamp(k, float(iteration))
+
+                # Cascading release
+                for agent in agents:
+                    agent.cascade_release()
+
+                # Check convergence
+                if self._is_converged(agents, num_agents):
+                    break
+
+        # 3. Build cost matrix
+        diff = agent_positions[:, None, :] - target_positions[None, :, :]
+        cost_matrix = np.sum(diff ** 2, axis=-1).astype(np.float32)
+
+        # 4. Build output assignments
         assignments = np.full(num_agents, -1, dtype=np.int64)
         for i, agent in enumerate(agents):
             if agent.b:
                 assignments[i] = agent.b[0]
 
-        # If any agent unassigned, greedy fallback
-        if np.any(assignments < 0):
-            unassigned = [i for i in range(num_agents) if assignments[i] < 0]
-            unused = [j for j in range(num_targets) if j not in assignments]
-            for idx, agent_idx in enumerate(unassigned):
-                if idx < len(unused):
-                    assignments[agent_idx] = unused[idx]
+        # Resolve remaining conflicts / unassigned agents greedily.
+        assigned_mask = assignments >= 0
+        _, counts = np.unique(assignments[assigned_mask], return_counts=True)
+        if np.any(counts > 1) or np.any(~assigned_mask):
+            claimed = set()
+            clean = np.full(num_agents, -1, dtype=np.int64)
+            order = np.argsort(cost_matrix.min(axis=1))
+            for i in order:
+                available = [j for j in range(num_targets) if j not in claimed]
+                if not available:
+                    break
+                best_j = available[int(np.argmin(cost_matrix[i, available]))]
+                clean[i] = best_j
+                claimed.add(best_j)
+            assignments = clean
 
         if np.any(assignments < 0):
             raise RuntimeError(
-                f"CBBA failed to assign all agents. "
+                f"CBBA/CBAA failed to assign all agents. "
                 f"Assigned: {assignments.tolist()}, "
                 f"converged at iteration {iteration + 1}."
             )
-
-        # Build cost matrix for diagnostics
-        diff = agent_positions[:, None, :] - target_positions[None, :, :]
-        cost_matrix = np.sum(diff ** 2, axis=-1).astype(np.float32)
 
         total_cost = float(sum(cost_matrix[i, assignments[i]] for i in range(num_agents)))
         info = {
             "assigner": "cbba",
             "total_assignment_cost": total_cost,
             "iterations": iteration + 1,
-            "converged": self._is_converged(agents, num_agents),
+            "converged": self._is_converged_cbaa(agents, num_agents),
         }
         return assignments, cost_matrix, info
 
     @staticmethod
     def _is_converged(agents: list[CBBAAgent], num_agents: int) -> bool:
-        """Check convergence: all z vectors agree and all agents assigned."""
+        """Check convergence (CBBA): all z vectors agree and all agents assigned."""
         if not agents:
             return False
         for j in range(agents[0].num_targets):
@@ -676,6 +730,23 @@ class CBBATargetAssigner(BaseTargetAssigner):
 
         assigned_count = sum(1 for a in agents if len(a.b) > 0)
         return assigned_count >= num_agents
+
+    @staticmethod
+    def _is_converged_cbaa(agents: list[CBBAAgent], num_agents: int) -> bool:
+        """Check convergence (CBAA): all agents assigned and no task conflicts."""
+        if not agents:
+            return False
+        # Every agent must hold exactly one task (L_t = 1).
+        if any(len(a.b) != 1 for a in agents):
+            return False
+        # No two agents may claim the same task.
+        claimed = set()
+        for a in agents:
+            task_j = a.b[0]
+            if task_j in claimed:
+                return False
+            claimed.add(task_j)
+        return True
 
 
 def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
