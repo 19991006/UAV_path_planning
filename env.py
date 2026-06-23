@@ -182,6 +182,12 @@ class MultiUAV2DEnv:
         self.action_dim = 2
         self.obs_dim = self.cfg.lidar_num_rays + 4 + 2 + 2 * (self.num_agents - 1)
 
+        # Graph-observation dimensions for GNN MAPPO.
+        # node_features_i = [lidar_i, ego_motion_i, assigned_target_i]
+        # edge_attr_ij = [dx_ij, dy_ij, distance_ij, bearing_ij]
+        self.node_dim = self.cfg.lidar_num_rays + 4 + 2
+        self.edge_dim = 4
+
         self.target_assigner = target_assigner or build_assigner(self.cfg.assigner_name)
         self.assignment_info: Dict = {}
 
@@ -634,6 +640,57 @@ class MultiUAV2DEnv:
                 f"expected {(self.num_agents, self.obs_dim)}."
             )
         return obs.astype(np.float32)
+
+    def get_graph_obs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return graph observation for GNN-based MAPPO.
+
+        Returns:
+            node_features: [num_agents, node_dim] — LiDAR + ego + target.
+            edge_index: [2, num_edges] — directed fully connected, no self-loops.
+            edge_attr: [num_edges, edge_dim] — [dx, dy, dist, bearing] normalized.
+        """
+        lidar_obs = self._compute_lidar_observations()
+        ego_obs = self._compute_ego_motion_observations()
+        target_obs = self._compute_target_observations()
+
+        node_features = np.concatenate([lidar_obs, ego_obs, target_obs], axis=1).astype(np.float32)
+        if node_features.shape != (self.num_agents, self.node_dim):
+            raise RuntimeError(
+                f"Graph node feature shape mismatch: got {node_features.shape}, "
+                f"expected {(self.num_agents, self.node_dim)}."
+            )
+
+        edge_index, edge_attr = self._build_agent_graph()
+        return node_features, edge_index, edge_attr
+
+    def _build_agent_graph(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Build a directed fully connected graph over UAV agents."""
+        src_list, dst_list, edge_attrs = [], [], []
+
+        world_scale = max(float(self.cfg.world_size), 1e-6)
+        comm_scale = max(float(self.cfg.communication_range), 1e-6)
+
+        for i in range(self.num_agents):
+            for j in range(self.num_agents):
+                if i == j:
+                    continue
+
+                rel = self.positions[j] - self.positions[i]
+                dx = float(rel[0] / world_scale)
+                dy = float(rel[1] / world_scale)
+                dist = float(np.linalg.norm(rel))
+                dist_norm = dist / comm_scale
+
+                bearing = np.arctan2(rel[1], rel[0]) - self.headings[i]
+                bearing_norm = float(self._wrap_angle(bearing) / np.pi)
+
+                src_list.append(i)
+                dst_list.append(j)
+                edge_attrs.append([dx, dy, dist_norm, bearing_norm])
+
+        edge_index = np.asarray([src_list, dst_list], dtype=np.int64)
+        edge_attr = np.asarray(edge_attrs, dtype=np.float32)
+        return edge_index, edge_attr
 
     def _compute_lidar_observations(self) -> np.ndarray:
         """Vectorized 2D LiDAR via batch ray-circle intersection."""
