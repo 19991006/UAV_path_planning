@@ -31,6 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from env import MultiUAV2DEnv, UAVEnvConfig
 from mappo import MAPPOAgent, MAPPOConfig
+from gnn_mappo import GraphMAPPOAgent
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-agents", type=int, default=3)
     parser.add_argument("--num-obstacles", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=600)
-    parser.add_argument("--assigner-name", type=str, default="fixed", choices=["hungarian", "greedy", "fixed", "cross"])
+    parser.add_argument("--assigner-name", type=str, default="fixed",
+                        choices=["hungarian", "greedy", "fixed", "cross", "cbba"])
     parser.add_argument("--lidar-num-rays", type=int, default=35)
     parser.add_argument("--lidar-range", type=float, default=5.0)
     parser.add_argument("--layout-mode", type=str, default="same_side",
@@ -80,6 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-hidden-layers", type=int, default=2)
     parser.add_argument("--activation", type=str, default="relu", choices=["tanh", "relu", "gelu", "elu"])
 
+    # GNN.
+    parser.add_argument("--use-gnn", action="store_true", default=False,
+                        help="Use GNN MAPPO agent (agent-count generalizable)")
+    parser.add_argument("--torch-num-threads", type=int, default=1,
+                        help="Set torch CPU threads (default 1 avoids oversubscription on small GNN batches)")
+
     # Logging / saving / evaluation.
     parser.add_argument("--log-interval", type=int, default=1)
     parser.add_argument("--eval-interval", type=int, default=100)
@@ -100,9 +108,9 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def make_env(args: argparse.Namespace, seed_offset: int = 0) -> MultiUAV2DEnv:
+def make_env(args: argparse.Namespace, seed_offset: int = 0, num_agents: int | None = None) -> MultiUAV2DEnv:
     cfg = UAVEnvConfig(
-        num_agents=args.num_agents,
+        num_agents=args.num_agents if num_agents is None else num_agents,
         num_obstacles=args.num_obstacles,
         max_steps=args.max_steps,
         assigner_name=args.assigner_name,
@@ -114,7 +122,7 @@ def make_env(args: argparse.Namespace, seed_offset: int = 0) -> MultiUAV2DEnv:
     return MultiUAV2DEnv(cfg)
 
 
-def make_agent(env: MultiUAV2DEnv, args: argparse.Namespace) -> MAPPOAgent:
+def make_agent(env: MultiUAV2DEnv, args: argparse.Namespace):
     cfg = MAPPOConfig(
         rollout_steps=args.rollout_steps,
         gamma=args.gamma,
@@ -133,6 +141,8 @@ def make_agent(env: MultiUAV2DEnv, args: argparse.Namespace) -> MAPPOAgent:
         activation=args.activation,
         device=args.device,
     )
+    if args.use_gnn:
+        return GraphMAPPOAgent(env, cfg)
     return MAPPOAgent(env, cfg)
 
 
@@ -239,6 +249,9 @@ def main() -> None:
         json.dump(vars(args), f, indent=2)
     print(f"Config saved to: {config_path}")
 
+    if args.torch_num_threads and args.torch_num_threads > 0:
+        torch.set_num_threads(args.torch_num_threads)
+
     writer = SummaryWriter(log_dir)
 
     env = make_env(args, seed_offset=0)
@@ -249,12 +262,18 @@ def main() -> None:
         agent.load(args.resume_checkpoint)
         print(f"Resume training from update={agent.num_updates}, env_steps={agent.total_env_steps}")
 
-    print("DA-MAPPO training started")
+    algo = "GNN-MAPPO" if args.use_gnn else "MLP-MAPPO"
+    print(f"DA-MAPPO training started [{algo}]")
     print(f"run_dir: {run_dir}")
     print(f"device: {agent.device}")
     print(f"num_agents: {agent.num_agents}")
-    print(f"obs_dim: {agent.obs_dim}")
-    print(f"state_dim: {agent.state_dim}")
+    if args.use_gnn:
+        print(f"node_dim: {agent.node_dim}")
+        print(f"edge_dim: {agent.edge_dim}")
+        print(f"num_edges: {agent.num_edges}")
+    else:
+        print(f"obs_dim: {agent.obs_dim}")
+        print(f"state_dim: {agent.state_dim}")
     print(f"action_dim: {agent.action_dim}")
     print(f"rollout_steps: {args.rollout_steps}")
     print(f"num_obstacles: {args.num_obstacles}")

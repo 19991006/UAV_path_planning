@@ -18,6 +18,7 @@ import torch
 
 from env import MultiUAV2DEnv, UAVEnvConfig
 from mappo import MAPPOAgent, MAPPOConfig
+from gnn_mappo import GraphMAPPOAgent
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +52,14 @@ def parse_args() -> argparse.Namespace:
                         help="Save MP4 video of the best episode")
     parser.add_argument("--video-fps", type=int, default=10,
                         help="FPS for saved video (default: 10)")
+
+    # GNN.
+    parser.add_argument("--eval-num-agents", type=int, default=None,
+                        help="Override num_agents for evaluation (GNN cross-N tests)")
+    parser.add_argument("--use-gnn", action="store_true",
+                        help="Force GNN agent. If omitted, config.json use_gnn is used.")
+    parser.add_argument("--torch-num-threads", type=int, default=1,
+                        help="Set torch CPU threads (default 1 for small GNN batches)")
     return parser.parse_args()
 
 
@@ -76,10 +85,11 @@ def set_seed(seed: int) -> None:
 def make_env_from_config(train_args: dict, seed_offset: int = 0,
                          num_obstacles: int | None = None,
                          layout_mode: str | None = None,
-                         dynamic_targets: bool | None = None) -> MultiUAV2DEnv:
+                         dynamic_targets: bool | None = None,
+                         eval_num_agents: int | None = None) -> MultiUAV2DEnv:
     """Build env from saved training config."""
     cfg = UAVEnvConfig(
-        num_agents=train_args["num_agents"],
+        num_agents=eval_num_agents if eval_num_agents is not None else train_args["num_agents"],
         num_obstacles=num_obstacles if num_obstacles is not None else train_args[
             "num_obstacles"],
         max_steps=train_args["max_steps"],
@@ -102,7 +112,8 @@ def make_env_from_config(train_args: dict, seed_offset: int = 0,
 
 
 def load_agent_from_run(env: MultiUAV2DEnv, run_dir: Path, train_args: dict, device: str,
-                        checkpoint: str = "best.pt") -> MAPPOAgent:
+                        checkpoint: str = "best.pt",
+                        use_gnn: bool = False):
     """Build agent from saved config and load checkpoint."""
     mappo_cfg = MAPPOConfig(
         rollout_steps=train_args["rollout_steps"],
@@ -113,12 +124,15 @@ def load_agent_from_run(env: MultiUAV2DEnv, run_dir: Path, train_args: dict, dev
         activation=train_args["activation"],
         device=device,
     )
-    agent = MAPPOAgent(env, mappo_cfg)
+    agent = GraphMAPPOAgent(env, mappo_cfg) if use_gnn else MAPPOAgent(env, mappo_cfg)
 
     checkpoint_path = run_dir / "checkpoints" / checkpoint
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    agent.load(checkpoint_path)
+    if use_gnn:
+        agent.load(checkpoint_path, load_optimizer=False)
+    else:
+        agent.load(checkpoint_path)
     agent.model.eval()
     return agent
 
@@ -379,12 +393,17 @@ def aggregate_metrics(metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
 def main() -> None:
     args = parse_args()
     run_dir = Path(args.run_dir)
+
+    if args.torch_num_threads and args.torch_num_threads > 0:
+        torch.set_num_threads(args.torch_num_threads)
+
     run_tag = (
         args.run_tag
         if args.run_tag is not None else
         args.run_dir.strip("\\").split("\\")[-1]
     )
     train_args = load_run_config(run_dir)
+    use_gnn = bool(args.use_gnn or train_args.get("use_gnn", False))
     print(f"Loaded config from: {run_dir / 'config.json'}")
 
     output_dir = Path(args.output_dir + f"/{run_tag}")
@@ -398,12 +417,15 @@ def main() -> None:
         seed_offset=0,
         num_obstacles=args.num_obstacles,
         layout_mode=args.layout_mode,
-        dynamic_targets=args.dynamic_targets
+        dynamic_targets=args.dynamic_targets,
+        eval_num_agents=args.eval_num_agents,
     )
     agent = load_agent_from_run(
-        env, run_dir, train_args, args.device, args.checkpoint)
+        env, run_dir, train_args, args.device, args.checkpoint,
+        use_gnn=use_gnn)
 
-    print("DA-MAPPO evaluation started")
+    algo = "GNN-MAPPO" if use_gnn else "MLP-MAPPO"
+    print(f"DA-MAPPO evaluation started [{algo}]")
     print(f"run_dir: {run_dir}")
     print(f"checkpoint: {run_dir / 'checkpoints' / args.checkpoint}")
     print(f"device: {agent.device}")
@@ -411,8 +433,13 @@ def main() -> None:
     print(f"num_agents: {env.num_agents}")
     print(f"num_obstacles: {train_args['num_obstacles']}")
     print(f"assigner: {train_args['assigner_name']}")
-    print(f"obs_dim: {agent.obs_dim}")
-    print(f"state_dim: {agent.state_dim}")
+    if use_gnn:
+        print(f"node_dim: {agent.node_dim}")
+        print(f"edge_dim: {agent.edge_dim}")
+        print(f"num_edges: {agent.num_edges}")
+    else:
+        print(f"obs_dim: {agent.obs_dim}")
+        print(f"state_dim: {agent.state_dim}")
     print("-" * 80)
 
     all_metrics: List[Dict[str, float]] = []
