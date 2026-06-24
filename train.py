@@ -64,6 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assigner-name", type=str, default="fixed",
                         choices=["hungarian", "greedy", "fixed", "cross", "cbba"],
                         help="Online target assignment algorithm")
+    parser.add_argument("--reassign-interval", type=int, default=10,
+                        help="Steps between full reassignments (1 = every step)")
     parser.add_argument("--lidar-num-rays", type=int, default=35,
                         help="Number of LiDAR rays per UAV for obstacle sensing")
     parser.add_argument("--lidar-range", type=float, default=5.0,
@@ -163,6 +165,7 @@ def make_env(args: argparse.Namespace, seed_offset: int = 0, num_agents: int | N
         num_obstacles=args.num_obstacles,
         max_steps=args.max_steps,
         assigner_name=args.assigner_name,
+        reassign_interval=args.reassign_interval,
         lidar_num_rays=args.lidar_num_rays,
         lidar_range=args.lidar_range,
         layout_mode=args.layout_mode,
