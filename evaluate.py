@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
                         help="Show plots interactively")
     parser.add_argument("--num-obstacles", type=int, default=None,
                         help="Override num_obstacles from training config")
+    parser.add_argument("--assigner-name", type=str, default=None,
+                        help="Override assigner_name from training config (e.g. 'hungarian', 'greedy', 'fixed', 'cbba')")
     parser.add_argument("--layout-mode", type=str, default=None,
                         help="Override layout_mode from training config (e.g. 'same_side', 'cross')")
     parser.add_argument("--dynamic-targets", type=bool, default=None,
@@ -60,8 +62,8 @@ def parse_args() -> argparse.Namespace:
                         help="Override racetrack_back_speed")
     parser.add_argument("--save-video", action="store_true",
                         help="Save MP4 video of the best episode")
-    parser.add_argument("--video-fps", type=int, default=10,
-                        help="FPS for saved video (default: 10)")
+    parser.add_argument("--video-fps", type=int, default=30,
+                        help="FPS for saved video (default: 30)")
 
     # GNN.
     parser.add_argument("--eval-num-agents", type=int, default=None,
@@ -94,6 +96,7 @@ def set_seed(seed: int) -> None:
 
 def make_env_from_config(train_args: dict, seed_offset: int = 0,
                          num_obstacles: int | None = None,
+                         assigner_name: str | None = None,
                          layout_mode: str | None = None,
                          dynamic_targets: bool | None = None,
                          target_motion_mode: str | None = None,
@@ -108,7 +111,12 @@ def make_env_from_config(train_args: dict, seed_offset: int = 0,
         num_obstacles=num_obstacles if num_obstacles is not None else train_args[
             "num_obstacles"],
         max_steps=train_args["max_steps"],
-        assigner_name=train_args["assigner_name"],
+        assigner_name=(
+            assigner_name
+            if assigner_name is not None else
+            train_args["assigner_name"]
+        ),
+        reassign_interval=train_args.get("reassign_interval", 10),
         lidar_num_rays=train_args["lidar_num_rays"],
         lidar_range=train_args["lidar_range"],
         layout_mode=(
@@ -286,19 +294,10 @@ def plot_trajectory(
     for t_id, target in enumerate(target_positions):
         ax.text(target[0], target[1], f"T{t_id}")
 
-    # UAV trajectories (truncated at first arrival for cleaner rendering).
-    arrived_history = trajectory_data.get("arrived_history")
+    # UAV trajectories (full, since agents do not freeze after arrival).
     for i in range(num_agents):
         full_traj = positions_history[:, i, :]
-
-        if arrived_history is not None and arrived_history.shape[0] > 0:
-            arrived_indices = np.where(arrived_history[:, i])[0]
-            end_idx = int(arrived_indices[0]) if len(
-                arrived_indices) > 0 else full_traj.shape[0] - 1
-        else:
-            end_idx = full_traj.shape[0] - 1
-
-        traj = full_traj[: end_idx + 1]
+        traj = full_traj
         ax.plot(traj[:, 0], traj[:, 1], linewidth=2, label=f"UAV {i}")
         ax.scatter(traj[0, 0], traj[0, 1], marker="o", s=80)
         ax.scatter(traj[-1, 0], traj[-1, 1], marker="x", s=100)
@@ -479,6 +478,7 @@ def main() -> None:
         train_args,
         seed_offset=0,
         num_obstacles=args.num_obstacles,
+        assigner_name=args.assigner_name,
         layout_mode=args.layout_mode,
         dynamic_targets=args.dynamic_targets,
         target_motion_mode=args.target_motion_mode,
