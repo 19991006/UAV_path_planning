@@ -46,7 +46,7 @@ class CBBAConfig:
             automatically from agent/target positions at assign() time.
     """
     L_t: int = 1
-    max_iterations: int = 500
+    max_iterations: int = 50
     use_timestamps: bool = False
     communication_graph: Optional[np.ndarray] = None
     squared_distance: bool = True
@@ -623,6 +623,7 @@ class CBBATargetAssigner(BaseTargetAssigner):
 
                 # --- Snapshot ---
                 y_snapshot = [a.y.copy() for a in agents]
+                prev_bundles = [list(a.b) for a in agents]
 
                 # --- Max-consensus (Line 3-4) ---
                 for i in range(num_agents):
@@ -654,8 +655,16 @@ class CBBATargetAssigner(BaseTargetAssigner):
                         agents[i].p = []
                         agents[i].total_score = 0.0
 
-                # Convergence: all agents assigned and no duplicate task claims.
+                # Convergence or early exit.
                 if self._is_converged_cbaa(agents, num_agents):
+                    break
+                # Early exit after a stationary iteration: no agent released
+                # and no new bids placed — the assignment is stable.  The
+                # greedy fallback at the output stage handles remaining gaps.
+                bundles_unchanged = all(
+                    list(a.b) == prev_bundles[idx] for idx, a in enumerate(agents)
+                )
+                if bundles_unchanged:
                     break
             else:
                 # CBBA Phase 2 — Table I pairwise consensus.

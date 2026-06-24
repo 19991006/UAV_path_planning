@@ -83,10 +83,13 @@ class UAVEnvConfig:
     racetrack_turn_radius: float = 0.5
     racetrack_straight_half_length: float = 9.0
     racetrack_front_speed: float = 0.2
+    # Auto-derived in __post_init__ from front_speed + geometry + target_y_gap.
+    # Config value is ignored; kept for backward compatibility.
     racetrack_back_speed: float = 2.0
 
     # Assignment settings. Options: "hungarian", "greedy", "fixed".
     assigner_name: str = "hungarian"
+    reassign_interval: int = 10  # steps between full reassignments (1 = every step)
 
     # LiDAR settings.
     lidar_num_rays: int = 35
@@ -94,7 +97,7 @@ class UAVEnvConfig:
     lidar_fov: float = 2.0 * np.pi
 
     # Communication / topology observation.
-    communication_range: float = 5.0
+    communication_range: float = 8.0
     use_communication_range_mask: bool = False
 
     # Obstacle settings.
@@ -158,6 +161,14 @@ class UAVEnvConfig:
         self.racetrack_turn_radius *= scale_factor
         self.racetrack_straight_half_length *= scale_factor
 
+        # Auto-derive back speed so that the rearmost target's loop-around time
+        # equals the inter-target gap traversal time on the front.
+        # v_back = v_front * (2πR + 2L) / target_y_gap
+        R = self.racetrack_turn_radius
+        L = self.racetrack_straight_half_length
+        back_route_len = 2.0 * np.pi * R + 2.0 * L
+        self.racetrack_back_speed = self.racetrack_front_speed * back_route_len / self.target_y_gap
+
 
 class MultiUAV2DEnv:
     """
@@ -220,6 +231,7 @@ class MultiUAV2DEnv:
         self.obstacle_radii = np.zeros((self.cfg.num_obstacles,), dtype=np.float32)
 
         self.step_count = 0
+        self._steps_since_reassign = 0
         self.trajectory_lengths = np.zeros((self.num_agents,), dtype=np.float32)
         self.previous_target_distances = np.zeros((self.num_agents,), dtype=np.float32)
 
@@ -260,6 +272,7 @@ class MultiUAV2DEnv:
             self._reset_uavs()
             self._reset_targets()
         self._generate_obstacles()
+        self._steps_since_reassign = self.cfg.reassign_interval  # force reassign on reset
         self._update_assignments()
 
         self.previous_target_distances = self._compute_assigned_target_distances()
@@ -571,6 +584,10 @@ class MultiUAV2DEnv:
             self._init_racetrack_positions()
             return  # _init_racetrack_positions already set positions and velocities
 
+        t_gap = self.cfg.target_y_gap / self.cfg.racetrack_front_speed
+        if self._racetrack_elapsed >= t_gap:
+            return
+
         R = self.cfg.racetrack_turn_radius
         L = self.cfg.racetrack_straight_half_length
         straight_len = 2.0 * L
@@ -613,6 +630,8 @@ class MultiUAV2DEnv:
             self.target_velocities[i, 0] = speed * tx
             self.target_velocities[i, 1] = speed * ty
 
+        self._racetrack_elapsed += self.cfg.dt
+
     def _init_racetrack_positions(self) -> None:
         """Place targets on the left vertical, matching the standard layout.
 
@@ -632,6 +651,7 @@ class MultiUAV2DEnv:
             self._racetrack_s[i] = y + L
             self.target_velocities[i, 0] = 0.0
             self.target_velocities[i, 1] = self.cfg.racetrack_front_speed
+        self._racetrack_elapsed = 0.0
 
     def _racetrack_s_to_position(self, s: float):
         """Map arc-length s to (x, y) and unit tangent (tx, ty) on the stadium.
@@ -684,6 +704,11 @@ class MultiUAV2DEnv:
 
     def _update_assignments(self) -> None:
         """Update agent-target assignment through the pluggable assignment module."""
+        self._steps_since_reassign += 1
+        if self._steps_since_reassign < self.cfg.reassign_interval:
+            return
+        self._steps_since_reassign = 0
+
         dists = np.linalg.norm(
             self.positions[:, None, :] - self.positions[None, :, :], axis=-1
         )
