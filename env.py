@@ -819,8 +819,8 @@ class MultiUAV2DEnv:
 
         Returns:
             node_features: [num_agents, node_dim] — LiDAR + ego + target.
-            edge_index: [2, num_edges] — directed fully connected, no self-loops.
-            edge_attr: [num_edges, edge_dim] — [dx, dy, dist, bearing] normalized.
+            edge_index: [2, E] — distance-gated directed edges (within communication_range).
+            edge_attr: [E, edge_dim] — [dx, dy, dist_norm, bearing_norm] normalized.
         """
         lidar_obs = self._compute_lidar_observations()
         ego_obs = self._compute_ego_motion_observations()
@@ -837,7 +837,10 @@ class MultiUAV2DEnv:
         return node_features, edge_index, edge_attr
 
     def _build_agent_graph(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Build a directed fully connected graph over UAV agents."""
+        """Build a directed distance-based graph over UAV agents.
+
+        An edge i->j exists only when ||pos_j - pos_i|| <= communication_range.
+        """
         src_list, dst_list, edge_attrs = [], [], []
 
         world_scale = max(float(self.cfg.world_size), 1e-6)
@@ -852,6 +855,10 @@ class MultiUAV2DEnv:
                 dx = float(rel[0] / world_scale)
                 dy = float(rel[1] / world_scale)
                 dist = float(np.linalg.norm(rel))
+
+                if dist > self.cfg.communication_range:
+                    continue
+
                 dist_norm = dist / comm_scale
 
                 bearing = np.arctan2(rel[1], rel[0]) - self.headings[i]
@@ -860,6 +867,12 @@ class MultiUAV2DEnv:
                 src_list.append(i)
                 dst_list.append(j)
                 edge_attrs.append([dx, dy, dist_norm, bearing_norm])
+
+        if len(src_list) == 0:
+            return (
+                np.empty((2, 0), dtype=np.int64),
+                np.empty((0, self.edge_dim), dtype=np.float32),
+            )
 
         edge_index = np.asarray([src_list, dst_list], dtype=np.int64)
         edge_attr = np.asarray(edge_attrs, dtype=np.float32)

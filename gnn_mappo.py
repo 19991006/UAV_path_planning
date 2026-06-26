@@ -35,7 +35,6 @@ class GraphMAPPOAgent:
         self.num_agents = self.env.num_agents
         self.node_dim = int(node_features.shape[1])
         self.edge_dim = int(edge_attr.shape[1])
-        self.num_edges = int(edge_attr.shape[0])
         self.action_dim = self.env.action_dim
 
         network_config = GraphNetworkConfig(
@@ -65,13 +64,12 @@ class GraphMAPPOAgent:
             num_agents=self.num_agents,
             node_dim=self.node_dim,
             edge_dim=self.edge_dim,
-            num_edges=self.num_edges,
             action_dim=self.action_dim,
             gamma=self.cfg.gamma,
             gae_lambda=self.cfg.gae_lambda,
             device=str(self.device),
         )
-        self.buffer = GraphRolloutBuffer(buffer_config, edge_index=edge_index)
+        self.buffer = GraphRolloutBuffer(buffer_config)
 
         self.total_env_steps = 0
         self.num_updates = 0
@@ -114,7 +112,9 @@ class GraphMAPPOAgent:
                     edge_attr_t,
                     deterministic=False,
                 )
-                value_t = self.model.value(node_features_t, edge_index_t, edge_attr_t)
+                # Single-graph forward: batch = zeros(N)
+                batch_t = torch.zeros(node_features_t.shape[0], dtype=torch.long, device=self.device)
+                value_t = self.model.value(node_features_t, edge_index_t, edge_attr_t, batch_t)
 
             actions = actions_t.cpu().numpy().astype(np.float32)
             log_probs = log_probs_t.cpu().numpy().astype(np.float32)
@@ -125,6 +125,7 @@ class GraphMAPPOAgent:
 
             self.buffer.add(
                 node_features=node_features,
+                edge_index=edge_index,
                 edge_attr=edge_attr,
                 actions=actions,
                 log_probs=log_probs,
@@ -151,8 +152,9 @@ class GraphMAPPOAgent:
             node_features_t, edge_index_t, edge_attr_t = self._graph_to_tensors(
                 node_features, edge_index, edge_attr
             )
+            batch_t = torch.zeros(node_features_t.shape[0], dtype=torch.long, device=self.device)
             with torch.no_grad():
-                last_value = float(self.model.value(node_features_t, edge_index_t, edge_attr_t).item())
+                last_value = float(self.model.value(node_features_t, edge_index_t, edge_attr_t, batch_t).item())
 
         self.buffer.compute_returns_and_advantages(
             last_value=last_value,
@@ -210,21 +212,28 @@ class GraphMAPPOAgent:
         }
 
     def _update_minibatch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        node_features = batch["node_features"]
-        edge_index = batch["edge_index"]
-        edge_attrs = batch["edge_attrs"]
-        actions = batch["actions"]
-        old_log_probs = batch["old_log_probs"]
-        advantages = batch["advantages"]
-        returns = batch["returns"]
-        old_values = batch["old_values"]
+        node_features = batch["node_features"]  # [N_total, H]
+        edge_index = batch["edge_index"]         # [2, E_total]
+        edge_attrs = batch["edge_attrs"]         # [E_total, F]
+        batch_vec = batch["batch"]                # [N_total]
+        actions = batch["actions"]                # [B, N, action_dim]
+        old_log_probs = batch["old_log_probs"]    # [B, N]
+        advantages = batch["advantages"]          # [B, N]
+        returns = batch["returns"]                # [B, N]
+        old_values = batch["old_values"]          # [B]
 
-        new_log_probs, entropy, new_values = self.model.evaluate_actions(
+        B = old_log_probs.shape[0]
+
+        # Evaluate: Actor takes flat actions [N_total, action_dim]
+        new_log_probs_flat, entropy_flat, new_values = self.model.evaluate_actions(
             node_features,
             edge_index,
             edge_attrs,
-            actions,
+            actions.view(-1, self.action_dim),
+            batch_vec,
         )
+        new_log_probs = new_log_probs_flat.view(B, -1)  # [B, N]
+        entropy = entropy_flat.view(B, -1)               # [B, N]
 
         log_ratio = new_log_probs - old_log_probs
         ratio = torch.exp(log_ratio)

@@ -505,7 +505,7 @@ def main() -> None:
     if use_gnn:
         print(f"node_dim: {agent.node_dim}")
         print(f"edge_dim: {agent.edge_dim}")
-        print(f"num_edges: {agent.num_edges}")
+        print(f"num_edges: dynamic (distance-gated per step)")
     else:
         print(f"obs_dim: {agent.obs_dim}")
         print(f"state_dim: {agent.state_dim}")

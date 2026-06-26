@@ -20,7 +20,6 @@ class GraphBufferConfig:
     num_agents: int
     node_dim: int
     edge_dim: int
-    num_edges: int
     action_dim: int = 2
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -28,31 +27,28 @@ class GraphBufferConfig:
 
 
 class GraphRolloutBuffer:
-    """Fixed-size rollout buffer storing complete graphs per time step."""
+    """Rollout buffer storing variable-shaped graphs per time step."""
 
-    def __init__(self, config: GraphBufferConfig, edge_index: np.ndarray):
+    def __init__(self, config: GraphBufferConfig):
         self.cfg = config
         self.rollout_steps = config.rollout_steps
         self.num_agents = config.num_agents
         self.node_dim = config.node_dim
         self.edge_dim = config.edge_dim
-        self.num_edges = config.num_edges
         self.action_dim = config.action_dim
         self.device = torch.device(config.device)
 
-        edge_index = np.asarray(edge_index, dtype=np.int64)
-        if edge_index.shape != (2, self.num_edges):
-            raise ValueError(f"edge_index shape {edge_index.shape}, expected {(2, self.num_edges)}")
-        self.edge_index_np = edge_index
-        self.edge_index = torch.as_tensor(edge_index, dtype=torch.long, device=self.device)
-
+        # Fixed-N arrays -- pre-allocated as before
         self.node_features = np.zeros((self.rollout_steps, self.num_agents, self.node_dim), dtype=np.float32)
-        self.edge_attrs = np.zeros((self.rollout_steps, self.num_edges, self.edge_dim), dtype=np.float32)
         self.actions = np.zeros((self.rollout_steps, self.num_agents, self.action_dim), dtype=np.float32)
         self.log_probs = np.zeros((self.rollout_steps, self.num_agents), dtype=np.float32)
         self.rewards = np.zeros((self.rollout_steps, self.num_agents), dtype=np.float32)
         self.dones = np.zeros((self.rollout_steps, self.num_agents), dtype=np.float32)
         self.values = np.zeros((self.rollout_steps,), dtype=np.float32)
+
+        # Variable-length graph structure -- stored as lists
+        self.edge_index_list: list[np.ndarray] = [None] * self.rollout_steps
+        self.edge_attr_list: list[np.ndarray] = [None] * self.rollout_steps
 
         self.advantages = np.zeros((self.rollout_steps, self.num_agents), dtype=np.float32)
         self.returns = np.zeros((self.rollout_steps, self.num_agents), dtype=np.float32)
@@ -67,6 +63,7 @@ class GraphRolloutBuffer:
     def add(
         self,
         node_features: np.ndarray,
+        edge_index: np.ndarray,
         edge_attr: np.ndarray,
         actions: np.ndarray,
         log_probs: np.ndarray,
@@ -78,6 +75,7 @@ class GraphRolloutBuffer:
             raise RuntimeError("GraphRolloutBuffer is full. Call reset() before adding more data.")
 
         node_features = np.asarray(node_features, dtype=np.float32)
+        edge_index = np.asarray(edge_index, dtype=np.int64)
         edge_attr = np.asarray(edge_attr, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
         log_probs = np.asarray(log_probs, dtype=np.float32)
@@ -86,8 +84,12 @@ class GraphRolloutBuffer:
 
         if node_features.shape != (self.num_agents, self.node_dim):
             raise ValueError(f"node_features shape {node_features.shape}, expected {(self.num_agents, self.node_dim)}")
-        if edge_attr.shape != (self.num_edges, self.edge_dim):
-            raise ValueError(f"edge_attr shape {edge_attr.shape}, expected {(self.num_edges, self.edge_dim)}")
+        if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+            raise ValueError(f"edge_index shape {edge_index.shape}, expected (2, E)")
+        if edge_attr.ndim != 2 or edge_attr.shape[1] != self.edge_dim:
+            raise ValueError(f"edge_attr shape {edge_attr.shape}, expected (E, {self.edge_dim})")
+        if edge_index.shape[1] != edge_attr.shape[0]:
+            raise ValueError(f"edge_index E ({edge_index.shape[1]}) != edge_attr E ({edge_attr.shape[0]})")
         if actions.shape != (self.num_agents, self.action_dim):
             raise ValueError(f"actions shape {actions.shape}, expected {(self.num_agents, self.action_dim)}")
         if log_probs.shape != (self.num_agents,):
@@ -100,7 +102,8 @@ class GraphRolloutBuffer:
             raise ValueError(f"dones shape {dones.shape}, expected {(self.num_agents,)}")
 
         self.node_features[self.ptr] = node_features
-        self.edge_attrs[self.ptr] = edge_attr
+        self.edge_index_list[self.ptr] = edge_index
+        self.edge_attr_list[self.ptr] = edge_attr
         self.actions[self.ptr] = actions
         self.log_probs[self.ptr] = log_probs
         self.rewards[self.ptr] = rewards
@@ -141,10 +144,10 @@ class GraphRolloutBuffer:
         shuffle: bool = True,
         normalize_advantages: bool = True,
     ) -> Iterator[Dict[str, torch.Tensor]]:
-        """Yield graph-time minibatches.
+        """Yield graph-time minibatches as concatenated large graphs.
 
-        batch_size is the number of complete graph time steps, not the number of
-        flattened agent samples.
+        batch_size is the number of complete graph time steps.
+        Multiple steps are concatenated into one large graph via index offset.
         """
         valid_steps = self.ptr
         if valid_steps == 0:
@@ -162,15 +165,44 @@ class GraphRolloutBuffer:
 
         for start in range(0, valid_steps, batch_size):
             idx = indices[start : start + batch_size]
+            K = len(idx)
+
+            # Flatten node features: [K, N, H] -> [K*N, H]
+            nf = torch.as_tensor(self.node_features[idx], dtype=torch.float32).view(-1, self.node_dim)
+
+            # Offset and concatenate edge_index
+            edge_list = []
+            offset = 0
+            for k, i in enumerate(idx):
+                ei = torch.as_tensor(self.edge_index_list[i], dtype=torch.long)
+                if ei.numel() > 0:
+                    edge_list.append(ei + offset)
+                offset += self.num_agents
+            if edge_list:
+                edge_index = torch.cat(edge_list, dim=1)
+            else:
+                edge_index = torch.empty(2, 0, dtype=torch.long)
+
+            # Concatenate edge_attr
+            edge_attr_list_valid = [torch.as_tensor(self.edge_attr_list[i], dtype=torch.float32) for i in idx]
+            if edge_attr_list_valid:
+                edge_attr = torch.cat(edge_attr_list_valid, dim=0)
+            else:
+                edge_attr = torch.empty(0, self.edge_dim, dtype=torch.float32)
+
+            # Build batch vector: [0,0,0, 1,1,1, ...] for K graphs x N nodes each
+            batch = torch.arange(K, dtype=torch.long).repeat_interleave(self.num_agents)
+
             yield {
-                "node_features": torch.as_tensor(self.node_features[idx], dtype=torch.float32, device=self.device),
-                "edge_attrs": torch.as_tensor(self.edge_attrs[idx], dtype=torch.float32, device=self.device),
-                "edge_index": self.edge_index,
+                "node_features": nf.to(self.device),
+                "edge_index": edge_index.to(self.device),
+                "edge_attrs": edge_attr.to(self.device),
                 "actions": torch.as_tensor(self.actions[idx], dtype=torch.float32, device=self.device),
                 "old_log_probs": torch.as_tensor(self.log_probs[idx], dtype=torch.float32, device=self.device),
                 "advantages": torch.as_tensor(advantages[idx], dtype=torch.float32, device=self.device),
                 "returns": torch.as_tensor(self.returns[idx], dtype=torch.float32, device=self.device),
                 "old_values": torch.as_tensor(self.values[idx], dtype=torch.float32, device=self.device),
+                "batch": batch.to(self.device),
             }
 
     def summary(self) -> Dict[str, float]:
