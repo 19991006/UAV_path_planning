@@ -819,8 +819,8 @@ class MultiUAV2DEnv:
 
         Returns:
             node_features: [num_agents, node_dim] — LiDAR + ego + target.
-            edge_index: [2, num_edges] — directed fully connected, no self-loops.
-            edge_attr: [num_edges, edge_dim] — [dx, dy, dist, bearing] normalized.
+            edge_index: [2, E] — distance-gated directed edges (within communication_range).
+            edge_attr: [E, edge_dim] — [dx, dy, dist_norm, bearing_norm] normalized.
         """
         lidar_obs = self._compute_lidar_observations()
         ego_obs = self._compute_ego_motion_observations()
