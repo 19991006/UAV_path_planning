@@ -104,10 +104,8 @@ def orthogonal_init(module: nn.Module, gain: float = 1.0) -> None:
 class GraphMessagePassingLayer(nn.Module):
     """One directed message-passing layer with edge features.
 
-    Supports:
-        h:          [N, H] or [B, N, H]
-        edge_index: [2, E]
-        edge_attr:  [E, F] or [B, E, F]
+    Always operates on 2D tensors. Multiple graphs are handled by
+    concatenating them into one large graph with offset edge indices.
     """
 
     def __init__(self, hidden_dim: int, edge_dim: int, activation: str = "relu"):
@@ -132,42 +130,28 @@ class GraphMessagePassingLayer(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
     ) -> torch.Tensor:
-        squeeze_batch = False
-        if h.dim() == 2:
-            h = h.unsqueeze(0)
-            edge_attr = edge_attr.unsqueeze(0)
-            squeeze_batch = True
-        elif h.dim() != 3:
-            raise ValueError(f"Expected h with dim 2 or 3, got shape {tuple(h.shape)}")
-
-        if edge_attr.dim() == 2:
-            edge_attr = edge_attr.unsqueeze(0).expand(h.shape[0], -1, -1)
-        elif edge_attr.dim() != 3:
-            raise ValueError(f"Expected edge_attr with dim 2 or 3, got shape {tuple(edge_attr.shape)}")
-
+        # h:         [N_total, H]
+        # edge_index: [2, E_total]
+        # edge_attr:  [E_total, F]
         edge_index = edge_index.long().to(h.device)
         edge_attr = edge_attr.to(device=h.device, dtype=h.dtype)
         src, dst = edge_index[0], edge_index[1]
 
-        h_src = h[:, src, :]
-        h_dst = h[:, dst, :]
+        h_src = h[src]   # [E_total, H]
+        h_dst = h[dst]   # [E_total, H]
         msg_input = torch.cat([h_src, h_dst, edge_attr], dim=-1)
-        messages = self.message_mlp(msg_input)
+        messages = self.message_mlp(msg_input)   # [E_total, H]
 
-        agg = torch.zeros_like(h)
-        agg.index_add_(1, dst, messages)
+        agg = torch.zeros_like(h)                # [N_total, H]
+        agg.index_add_(0, dst, messages)
 
-        deg = torch.zeros(h.shape[1], device=h.device, dtype=h.dtype)
+        deg = torch.zeros(h.shape[0], device=h.device, dtype=h.dtype)
         ones = torch.ones(dst.shape[0], device=h.device, dtype=h.dtype)
         deg.index_add_(0, dst, ones)
-        agg = agg / deg.clamp_min(1.0).view(1, -1, 1)
+        agg = agg / deg.clamp_min(1.0).view(-1, 1)
 
         updated = self.update_mlp(torch.cat([h, agg], dim=-1))
-        # Residual connection improves PPO stability.
-        h = h + updated
-
-        if squeeze_batch:
-            h = h.squeeze(0)
+        h = h + updated   # residual connection
         return h
 
 
