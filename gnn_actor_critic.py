@@ -181,6 +181,7 @@ class GraphActor(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
     ) -> TanhNormal:
+        """node_features: [N_total, node_dim], returns TanhNormal with mean [N_total, action_dim]."""
         h = self.node_encoder(node_features)
         for layer in self.gnn_layers:
             h = layer(h, edge_index, edge_attr)
