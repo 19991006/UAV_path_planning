@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
                         help="Path to checkpoint.pt for resuming training")
 
     # Environment.
-    parser.add_argument("--num-agents", type=int, default=3,
+    parser.add_argument("--num-agents", type=int, default=5,
                         help="Number of UAVs (target count always equals agent count)")
     parser.add_argument("--num-obstacles", type=int, default=20,
                         help="Number of circular obstacles placed in the arena")
@@ -94,11 +94,11 @@ def parse_args() -> argparse.Namespace:
     # Training.
     parser.add_argument("--total-updates", type=int, default=1000,
                         help="Number of PPO update iterations to run")
-    parser.add_argument("--rollout-steps", type=int, default=512,
+    parser.add_argument("--rollout-steps", type=int, default=4096,
                         help="Environment steps collected per rollout before each update")
     parser.add_argument("--ppo-epochs", type=int, default=10,
                         help="Number of PPO epochs per update (K in the paper)")
-    parser.add_argument("--minibatch-size", type=int, default=64,
+    parser.add_argument("--minibatch-size", type=int, default=512,
                         help="Minibatch size for PPO gradient steps")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="Discount factor for cumulative return")
@@ -137,9 +137,9 @@ def parse_args() -> argparse.Namespace:
     # Logging / saving / evaluation.
     parser.add_argument("--log-interval", type=int, default=1,
                         help="Log training metrics to CSV and TensorBoard every N updates")
-    parser.add_argument("--eval-interval", type=int, default=100,
+    parser.add_argument("--eval-interval", type=int, default=25,
                         help="Run deterministic evaluation every N updates (0 = skip)")
-    parser.add_argument("--save-interval", type=int, default=100,
+    parser.add_argument("--save-interval", type=int, default=25,
                         help="Save periodic checkpoints every N updates")
     parser.add_argument("--eval-episodes", type=int, default=5,
                         help="Number of episodes per evaluation run")
@@ -332,7 +332,8 @@ def main() -> None:
     if args.use_gnn:
         print(f"node_dim: {agent.node_dim}")
         print(f"edge_dim: {agent.edge_dim}")
-        print(f"num_edges: {agent.num_edges}")
+        print(f"actor_num_edges: {agent.actor_num_edges}")
+        print(f"critic_num_edges: {agent.critic_num_edges}")
     else:
         print(f"obs_dim: {agent.obs_dim}")
         print(f"state_dim: {agent.state_dim}")

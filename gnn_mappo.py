@@ -1,9 +1,21 @@
-"""GNN-MAPPO trainer for DA-MAPPO with agent-count-generalizable policies."""
+"""Strict CTDE GNN-MAPPO trainer for DA-MAPPO.
+
+Actor:
+- Shared EgoGraphActor.
+- Each UAV i receives only ego_graph_i.
+- ego_graph_i contains the center UAV and communication-range neighbors.
+- Non-neighbor padded slots are zeroed and have edge_mask=0.
+- The actor outputs only the center-node action for each ego graph.
+
+Critic:
+- Centralized full UAV graph.
+- Outputs one scalar V(s).
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -16,12 +28,11 @@ from mappo import MAPPOConfig
 
 
 class GraphMAPPOAgent:
-    """MAPPO trainer using a graph actor and graph critic.
+    """MAPPO trainer using strict ego-graph actor and full-graph critic.
 
-    This first version assumes a fixed number of agents inside one training run.
-    Checkpoints can still be loaded for evaluation with a different number of
-    agents because the neural network parameters depend on node_dim and edge_dim,
-    not num_agents.
+    One training run uses a fixed N because the rollout buffer is fixed-shape.
+    The checkpoint can still be loaded at a different N because network weights
+    depend on node_dim/edge_dim, not N.
     """
 
     def __init__(self, env, config: Optional[MAPPOConfig] = None):
@@ -30,13 +41,23 @@ class GraphMAPPOAgent:
         self.device = self._resolve_device(self.cfg.device)
 
         self.env.reset()
-        node_features, edge_index, edge_attr = self.env.get_graph_obs()
+        actor_ego_node_features, actor_ego_edge_index, actor_ego_edge_attr = self.env.get_actor_ego_graph_obs()
+        critic_node_features, critic_edge_index, critic_edge_attr = self.env.get_critic_graph_obs()
 
         self.num_agents = self.env.num_agents
-        self.node_dim = int(node_features.shape[1])
-        self.edge_dim = int(edge_attr.shape[1])
-        self.num_edges = int(edge_attr.shape[0])
+        self.node_dim = int(actor_ego_node_features.shape[-1])
+        self.edge_dim = int(actor_ego_edge_attr.shape[-1])
+        self.actor_ego_num_nodes = int(actor_ego_node_features.shape[1])
+        self.actor_ego_num_edges = int(actor_ego_edge_attr.shape[1])
+        self.critic_num_edges = int(critic_edge_attr.shape[0])
+        self.actor_num_edges = self.actor_ego_num_edges
+        self.num_edges = self.actor_ego_num_edges
         self.action_dim = self.env.action_dim
+
+        if critic_node_features.shape[1] != self.node_dim:
+            raise ValueError("Actor and critic node_dim must match in the current implementation.")
+        if critic_edge_attr.shape[1] != self.edge_dim:
+            raise ValueError("Actor and critic edge_dim must match in the current implementation.")
 
         network_config = GraphNetworkConfig(
             node_dim=self.node_dim,
@@ -65,13 +86,19 @@ class GraphMAPPOAgent:
             num_agents=self.num_agents,
             node_dim=self.node_dim,
             edge_dim=self.edge_dim,
-            num_edges=self.num_edges,
+            actor_ego_num_nodes=self.actor_ego_num_nodes,
+            actor_ego_num_edges=self.actor_ego_num_edges,
+            critic_num_edges=self.critic_num_edges,
             action_dim=self.action_dim,
             gamma=self.cfg.gamma,
             gae_lambda=self.cfg.gae_lambda,
             device=str(self.device),
         )
-        self.buffer = GraphRolloutBuffer(buffer_config, edge_index=edge_index)
+        self.buffer = GraphRolloutBuffer(
+            buffer_config,
+            actor_ego_edge_index=actor_ego_edge_index,
+            critic_edge_index=critic_edge_index,
+        )
 
         self.total_env_steps = 0
         self.num_updates = 0
@@ -82,7 +109,13 @@ class GraphMAPPOAgent:
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(device)
 
-    def _graph_to_tensors(self, node_features, edge_index, edge_attr):
+    def _actor_ego_to_tensors(self, ego_node_features, ego_edge_index, ego_edge_attr):
+        ego_node_features_t = torch.as_tensor(ego_node_features, dtype=torch.float32, device=self.device)
+        ego_edge_index_t = torch.as_tensor(ego_edge_index, dtype=torch.long, device=self.device)
+        ego_edge_attr_t = torch.as_tensor(ego_edge_attr, dtype=torch.float32, device=self.device)
+        return ego_node_features_t, ego_edge_index_t, ego_edge_attr_t
+
+    def _critic_graph_to_tensors(self, node_features, edge_index, edge_attr):
         node_features_t = torch.as_tensor(node_features, dtype=torch.float32, device=self.device)
         edge_index_t = torch.as_tensor(edge_index, dtype=torch.long, device=self.device)
         edge_attr_t = torch.as_tensor(edge_attr, dtype=torch.float32, device=self.device)
@@ -102,19 +135,28 @@ class GraphMAPPOAgent:
         last_transition_done = False
 
         for _ in range(self.cfg.rollout_steps):
-            node_features, edge_index, edge_attr = self.env.get_graph_obs()
-            node_features_t, edge_index_t, edge_attr_t = self._graph_to_tensors(
-                node_features, edge_index, edge_attr
+            actor_ego_node_features, actor_ego_edge_index, actor_ego_edge_attr = self.env.get_actor_ego_graph_obs()
+            critic_node_features, critic_edge_index, critic_edge_attr = self.env.get_critic_graph_obs()
+
+            actor_ego_node_features_t, actor_ego_edge_index_t, actor_ego_edge_attr_t = self._actor_ego_to_tensors(
+                actor_ego_node_features, actor_ego_edge_index, actor_ego_edge_attr
+            )
+            critic_node_features_t, critic_edge_index_t, critic_edge_attr_t = self._critic_graph_to_tensors(
+                critic_node_features, critic_edge_index, critic_edge_attr
             )
 
             with torch.no_grad():
                 actions_t, log_probs_t = self.model.act(
-                    node_features_t,
-                    edge_index_t,
-                    edge_attr_t,
+                    actor_ego_node_features_t,
+                    actor_ego_edge_index_t,
+                    actor_ego_edge_attr_t,
                     deterministic=False,
                 )
-                value_t = self.model.value(node_features_t, edge_index_t, edge_attr_t)
+                value_t = self.model.value(
+                    critic_node_features_t,
+                    critic_edge_index_t,
+                    critic_edge_attr_t,
+                )
 
             actions = actions_t.cpu().numpy().astype(np.float32)
             log_probs = log_probs_t.cpu().numpy().astype(np.float32)
@@ -124,8 +166,10 @@ class GraphMAPPOAgent:
             last_transition_done = bool(np.all(dones))
 
             self.buffer.add(
-                node_features=node_features,
-                edge_attr=edge_attr,
+                actor_ego_node_features=actor_ego_node_features,
+                actor_ego_edge_attr=actor_ego_edge_attr,
+                critic_node_features=critic_node_features,
+                critic_edge_attr=critic_edge_attr,
                 actions=actions,
                 log_probs=log_probs,
                 rewards=rewards,
@@ -147,12 +191,18 @@ class GraphMAPPOAgent:
         if last_transition_done:
             last_value = 0.0
         else:
-            node_features, edge_index, edge_attr = self.env.get_graph_obs()
-            node_features_t, edge_index_t, edge_attr_t = self._graph_to_tensors(
-                node_features, edge_index, edge_attr
+            critic_node_features, critic_edge_index, critic_edge_attr = self.env.get_critic_graph_obs()
+            critic_node_features_t, critic_edge_index_t, critic_edge_attr_t = self._critic_graph_to_tensors(
+                critic_node_features, critic_edge_index, critic_edge_attr
             )
             with torch.no_grad():
-                last_value = float(self.model.value(node_features_t, edge_index_t, edge_attr_t).item())
+                last_value = float(
+                    self.model.value(
+                        critic_node_features_t,
+                        critic_edge_index_t,
+                        critic_edge_attr_t,
+                    ).item()
+                )
 
         self.buffer.compute_returns_and_advantages(
             last_value=last_value,
@@ -181,7 +231,6 @@ class GraphMAPPOAgent:
         clip_fractions = []
         total_losses = []
 
-        # For graph batches, minibatch_size means number of graph time steps.
         graph_batch_size = min(self.cfg.minibatch_size, max(1, self.buffer.ptr))
 
         for _ in range(self.cfg.ppo_epochs):
@@ -210,9 +259,12 @@ class GraphMAPPOAgent:
         }
 
     def _update_minibatch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        node_features = batch["node_features"]
-        edge_index = batch["edge_index"]
-        edge_attrs = batch["edge_attrs"]
+        actor_ego_node_features = batch["actor_ego_node_features"]
+        actor_ego_edge_index = batch["actor_ego_edge_index"]
+        actor_ego_edge_attrs = batch["actor_ego_edge_attrs"]
+        critic_node_features = batch["critic_node_features"]
+        critic_edge_index = batch["critic_edge_index"]
+        critic_edge_attrs = batch["critic_edge_attrs"]
         actions = batch["actions"]
         old_log_probs = batch["old_log_probs"]
         advantages = batch["advantages"]
@@ -220,9 +272,12 @@ class GraphMAPPOAgent:
         old_values = batch["old_values"]
 
         new_log_probs, entropy, new_values = self.model.evaluate_actions(
-            node_features,
-            edge_index,
-            edge_attrs,
+            actor_ego_node_features,
+            actor_ego_edge_index,
+            actor_ego_edge_attrs,
+            critic_node_features,
+            critic_edge_index,
+            critic_edge_attrs,
             actions,
         )
 
@@ -237,7 +292,6 @@ class GraphMAPPOAgent:
         )
         actor_loss = torch.max(unclipped_policy_loss, clipped_policy_loss).mean()
 
-        # One graph-level value is trained against all per-agent returns.
         value_pred = new_values.unsqueeze(-1).expand_as(returns)
         old_value_pred = old_values.unsqueeze(-1).expand_as(returns)
         if self.cfg.use_value_clipping:
@@ -291,18 +345,19 @@ class GraphMAPPOAgent:
     def act(self, obs: Optional[np.ndarray] = None, deterministic: bool = True) -> np.ndarray:
         """Get actions for evaluation.
 
-        The obs argument is ignored and kept only for compatibility with the old
-        evaluation loop. The graph policy always reads env.get_graph_obs().
+        obs is ignored and kept only for compatibility with the old evaluation loop.
+        The graph policy reads env.get_actor_ego_graph_obs(), meaning each action
+        is produced from that agent's local ego graph.
         """
-        node_features, edge_index, edge_attr = self.env.get_graph_obs()
-        node_features_t, edge_index_t, edge_attr_t = self._graph_to_tensors(
-            node_features, edge_index, edge_attr
+        actor_ego_node_features, actor_ego_edge_index, actor_ego_edge_attr = self.env.get_actor_ego_graph_obs()
+        actor_ego_node_features_t, actor_ego_edge_index_t, actor_ego_edge_attr_t = self._actor_ego_to_tensors(
+            actor_ego_node_features, actor_ego_edge_index, actor_ego_edge_attr
         )
         with torch.no_grad():
             actions_t, _ = self.model.act(
-                node_features_t,
-                edge_index_t,
-                edge_attr_t,
+                actor_ego_node_features_t,
+                actor_ego_edge_index_t,
+                actor_ego_edge_attr_t,
                 deterministic=deterministic,
             )
         return actions_t.cpu().numpy().astype(np.float32)
@@ -316,13 +371,17 @@ class GraphMAPPOAgent:
                 "actor_optimizer": self.actor_optimizer.state_dict(),
                 "critic_optimizer": self.critic_optimizer.state_dict(),
                 "config": self.cfg,
-                "model_type": "gnn",
+                "model_type": "gnn_ego_ctde",
+                "graph_type": "actor_ego_critic_full",
                 "total_env_steps": self.total_env_steps,
                 "num_updates": self.num_updates,
                 "node_dim": self.node_dim,
                 "edge_dim": self.edge_dim,
                 "action_dim": self.action_dim,
                 "train_num_agents": self.num_agents,
+                "actor_ego_num_nodes": self.actor_ego_num_nodes,
+                "actor_ego_num_edges": self.actor_ego_num_edges,
+                "critic_num_edges": self.critic_num_edges,
             },
             path,
         )

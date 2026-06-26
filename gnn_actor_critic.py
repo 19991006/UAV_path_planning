@@ -1,14 +1,12 @@
 """
-Graph actor-critic modules for GNN-MAPPO / DA-MAPPO.
+Graph actor-critic modules for strict CTDE GNN-MAPPO / DA-MAPPO.
 
-This version is designed for agent-count generalization:
-- Each UAV is represented as one graph node.
-- Teammate information is represented as directed edge features.
-- Actor produces one continuous action distribution per node.
-- Critic pools node embeddings into one graph-level V(s).
-
-No PyTorch Geometric dependency is required. The message-passing layer is
-implemented with native PyTorch operations.
+Design:
+- Actor is a shared ego-graph policy. For each UAV i, it receives only ego_graph_i:
+  center node = UAV i; neighbor nodes = UAVs within communication range; non-neighbor
+  padded slots are zeroed and have edge_mask=0. It outputs only the center action.
+- Critic is centralized. It receives the full UAV graph and outputs scalar V(s).
+- No PyTorch Geometric dependency is required.
 """
 
 from __future__ import annotations
@@ -23,8 +21,6 @@ from torch.distributions import Normal
 
 @dataclass
 class GraphNetworkConfig:
-    """GNN actor-critic hyperparameters."""
-
     node_dim: int
     edge_dim: int
     action_dim: int = 2
@@ -66,7 +62,6 @@ class TanhNormal:
         return (log_prob - correction).sum(dim=-1)
 
     def entropy(self) -> torch.Tensor:
-        # Practical approximation: entropy of pre-squash Gaussian.
         return self.normal.entropy().sum(dim=-1)
 
 
@@ -102,17 +97,21 @@ def orthogonal_init(module: nn.Module, gain: float = 1.0) -> None:
 
 
 class GraphMessagePassingLayer(nn.Module):
-    """One directed message-passing layer with edge features.
+    """Directed message passing with edge features and an edge mask.
 
     Supports:
         h:          [N, H] or [B, N, H]
         edge_index: [2, E]
         edge_attr:  [E, F] or [B, E, F]
+
+    The last edge feature is edge_mask in [0, 1]. mask=0 forces the edge to send
+    no message. This is used by the ego actor to block padded / non-neighbor slots.
     """
 
     def __init__(self, hidden_dim: int, edge_dim: int, activation: str = "relu"):
         super().__init__()
         act = get_activation(activation)
+        self.edge_dim = edge_dim
         self.message_mlp = nn.Sequential(
             nn.Linear(2 * hidden_dim + edge_dim, hidden_dim),
             act(),
@@ -126,63 +125,70 @@ class GraphMessagePassingLayer(nn.Module):
             act(),
         )
 
-    def forward(
-        self,
-        h: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
         squeeze_batch = False
         if h.dim() == 2:
             h = h.unsqueeze(0)
-            edge_attr = edge_attr.unsqueeze(0)
             squeeze_batch = True
         elif h.dim() != 3:
-            raise ValueError(f"Expected h with dim 2 or 3, got shape {tuple(h.shape)}")
+            raise ValueError(f"Expected h dim 2 or 3, got {tuple(h.shape)}")
 
         if edge_attr.dim() == 2:
             edge_attr = edge_attr.unsqueeze(0).expand(h.shape[0], -1, -1)
         elif edge_attr.dim() != 3:
-            raise ValueError(f"Expected edge_attr with dim 2 or 3, got shape {tuple(edge_attr.shape)}")
+            raise ValueError(f"Expected edge_attr dim 2 or 3, got {tuple(edge_attr.shape)}")
 
         edge_index = edge_index.long().to(h.device)
         edge_attr = edge_attr.to(device=h.device, dtype=h.dtype)
         src, dst = edge_index[0], edge_index[1]
 
-        h_src = h[:, src, :]
-        h_dst = h[:, dst, :]
-        msg_input = torch.cat([h_src, h_dst, edge_attr], dim=-1)
-        messages = self.message_mlp(msg_input)
+        if edge_attr.shape[-1] != self.edge_dim:
+            raise ValueError(f"edge_attr last dim {edge_attr.shape[-1]}, expected {self.edge_dim}")
 
-        agg = torch.zeros_like(h)
-        agg.index_add_(1, dst, messages)
+        if src.numel() == 0:
+            agg = torch.zeros_like(h)
+        else:
+            edge_mask = edge_attr[..., -1:].clamp(0.0, 1.0)  # [B, E, 1]
+            h_src = h[:, src, :]
+            h_dst = h[:, dst, :]
+            msg_input = torch.cat([h_src, h_dst, edge_attr], dim=-1)
+            messages = self.message_mlp(msg_input) * edge_mask
 
-        deg = torch.zeros(h.shape[1], device=h.device, dtype=h.dtype)
-        ones = torch.ones(dst.shape[0], device=h.device, dtype=h.dtype)
-        deg.index_add_(0, dst, ones)
-        agg = agg / deg.clamp_min(1.0).view(1, -1, 1)
+            agg = torch.zeros_like(h)
+            agg.index_add_(1, dst, messages)
+
+            deg = torch.zeros((h.shape[0], h.shape[1]), device=h.device, dtype=h.dtype)
+            deg.index_add_(1, dst, edge_mask.squeeze(-1))
+            agg = agg / deg.clamp_min(1.0).unsqueeze(-1)
 
         updated = self.update_mlp(torch.cat([h, agg], dim=-1))
-        # Residual connection improves PPO stability.
         h = h + updated
-
         if squeeze_batch:
             h = h.squeeze(0)
         return h
 
 
-class GraphActor(nn.Module):
-    """Shared graph actor. Produces one action distribution per UAV node."""
+class EgoGraphActor(nn.Module):
+    """Shared decentralized actor over padded ego graphs.
+
+    Input shapes:
+        ego_node_features: [M, D], [G, M, D], or [B, N, M, D]
+        ego_edge_index:    [2, E] using local ego-node indices
+        ego_edge_attr:     [E, F], [G, E, F], or [B, N, E, F]
+
+    Output distribution mean shapes:
+        [action_dim], [G, action_dim], or [B, N, action_dim]
+
+    Only node 0, the ego center node, is used for the action output.
+    """
 
     def __init__(self, config: GraphNetworkConfig):
         super().__init__()
         self.config = config
         self.node_encoder = make_mlp(config.node_dim, config.hidden_dim, config.hidden_dim, config.activation)
         self.gnn_layers = nn.ModuleList(
-            [
-                GraphMessagePassingLayer(config.hidden_dim, config.edge_dim, config.activation)
-                for _ in range(config.num_gnn_layers)
-            ]
+            [GraphMessagePassingLayer(config.hidden_dim, config.edge_dim, config.activation)
+             for _ in range(config.num_gnn_layers)]
         )
         self.mean_head = nn.Linear(config.hidden_dim, config.action_dim)
         self.log_std = nn.Parameter(torch.full((config.action_dim,), config.log_std_init))
@@ -191,28 +197,60 @@ class GraphActor(nn.Module):
             orthogonal_init(self)
             nn.init.constant_(self.mean_head.bias, 0.0)
 
+    def _flatten_ego_batch(self, ego_node_features: torch.Tensor, ego_edge_attr: torch.Tensor):
+        if ego_node_features.dim() == 2:
+            leading_shape = ()
+            flat_nodes = ego_node_features.unsqueeze(0)
+        elif ego_node_features.dim() >= 3:
+            leading_shape = tuple(ego_node_features.shape[:-2])
+            flat_nodes = ego_node_features.reshape(-1, ego_node_features.shape[-2], ego_node_features.shape[-1])
+        else:
+            raise ValueError(f"Invalid ego_node_features shape {tuple(ego_node_features.shape)}")
+
+        num_graphs = flat_nodes.shape[0]
+        if ego_edge_attr.dim() == 2:
+            flat_edges = ego_edge_attr.unsqueeze(0).expand(num_graphs, -1, -1)
+        elif ego_edge_attr.dim() >= 3:
+            flat_edges = ego_edge_attr.reshape(-1, ego_edge_attr.shape[-2], ego_edge_attr.shape[-1])
+            if flat_edges.shape[0] != num_graphs:
+                raise ValueError(
+                    f"ego_edge_attr leading graphs {flat_edges.shape[0]} != node graphs {num_graphs}"
+                )
+        else:
+            raise ValueError(f"Invalid ego_edge_attr shape {tuple(ego_edge_attr.shape)}")
+        return leading_shape, flat_nodes, flat_edges
+
     def forward(
         self,
-        node_features: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
+        ego_node_features: torch.Tensor,
+        ego_edge_index: torch.Tensor,
+        ego_edge_attr: torch.Tensor,
     ) -> TanhNormal:
-        h = self.node_encoder(node_features)
+        leading_shape, flat_nodes, flat_edges = self._flatten_ego_batch(ego_node_features, ego_edge_attr)
+
+        h = self.node_encoder(flat_nodes)
         for layer in self.gnn_layers:
-            h = layer(h, edge_index, edge_attr)
-        mean = self.mean_head(h)
+            h = layer(h, ego_edge_index, flat_edges)
+
+        center_h = h[:, 0, :]  # node 0 is the controlled ego UAV
+        mean = self.mean_head(center_h)
+        if leading_shape:
+            mean = mean.reshape(*leading_shape, self.config.action_dim)
+        else:
+            mean = mean.squeeze(0)
+
         log_std = torch.clamp(self.log_std, self.config.min_log_std, self.config.max_log_std)
         log_std = log_std.expand_as(mean)
         return TanhNormal(mean, log_std)
 
     def act(
         self,
-        node_features: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
+        ego_node_features: torch.Tensor,
+        ego_edge_index: torch.Tensor,
+        ego_edge_attr: torch.Tensor,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        dist = self.forward(node_features, edge_index, edge_attr)
+        dist = self.forward(ego_node_features, ego_edge_index, ego_edge_attr)
         if deterministic:
             actions = dist.deterministic()
             log_probs = dist.log_prob(actions)
@@ -222,12 +260,12 @@ class GraphActor(nn.Module):
 
     def evaluate_actions(
         self,
-        node_features: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
+        ego_node_features: torch.Tensor,
+        ego_edge_index: torch.Tensor,
+        ego_edge_attr: torch.Tensor,
         actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        dist = self.forward(node_features, edge_index, edge_attr)
+        dist = self.forward(ego_node_features, ego_edge_index, ego_edge_attr)
         log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
         return log_probs, entropy
@@ -241,10 +279,8 @@ class GraphCritic(nn.Module):
         self.config = config
         self.node_encoder = make_mlp(config.node_dim, config.hidden_dim, config.hidden_dim, config.activation)
         self.gnn_layers = nn.ModuleList(
-            [
-                GraphMessagePassingLayer(config.hidden_dim, config.edge_dim, config.activation)
-                for _ in range(config.num_gnn_layers)
-            ]
+            [GraphMessagePassingLayer(config.hidden_dim, config.edge_dim, config.activation)
+             for _ in range(config.num_gnn_layers)]
         )
         act = get_activation(config.activation)
         self.value_head = nn.Sequential(
@@ -256,24 +292,24 @@ class GraphCritic(nn.Module):
         if config.use_orthogonal_init:
             orthogonal_init(self)
 
-    def forward(
-        self,
-        node_features: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, node_features: torch.Tensor, edge_index: torch.Tensor, edge_attr: torch.Tensor) -> torch.Tensor:
         squeeze_batch = False
         if node_features.dim() == 2:
             node_features = node_features.unsqueeze(0)
-            if edge_attr.dim() == 2:
-                edge_attr = edge_attr.unsqueeze(0)
             squeeze_batch = True
+        elif node_features.dim() != 3:
+            raise ValueError(f"Expected node_features dim 2 or 3, got {tuple(node_features.shape)}")
+
+        if edge_attr.dim() == 2:
+            edge_attr = edge_attr.unsqueeze(0).expand(node_features.shape[0], -1, -1)
+        elif edge_attr.dim() != 3:
+            raise ValueError(f"Expected edge_attr dim 2 or 3, got {tuple(edge_attr.shape)}")
 
         h = self.node_encoder(node_features)
         for layer in self.gnn_layers:
             h = layer(h, edge_index, edge_attr)
 
-        graph_embedding = h.mean(dim=1)  # [B, H], stable across different N.
+        graph_embedding = h.mean(dim=1)
         value = self.value_head(graph_embedding).squeeze(-1)
         if squeeze_batch:
             value = value.squeeze(0)
@@ -281,37 +317,50 @@ class GraphCritic(nn.Module):
 
 
 class GraphActorCritic(nn.Module):
-    """Convenience wrapper holding graph actor and graph critic."""
+    """Shared ego-graph actor + full-graph centralized critic."""
 
     def __init__(self, config: GraphNetworkConfig):
         super().__init__()
-        self.actor = GraphActor(config)
+        self.actor = EgoGraphActor(config)
         self.critic = GraphCritic(config)
 
     def act(
         self,
-        node_features: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
+        actor_ego_node_features: torch.Tensor,
+        actor_ego_edge_index: torch.Tensor,
+        actor_ego_edge_attr: torch.Tensor,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.actor.act(node_features, edge_index, edge_attr, deterministic=deterministic)
+        return self.actor.act(
+            actor_ego_node_features,
+            actor_ego_edge_index,
+            actor_ego_edge_attr,
+            deterministic=deterministic,
+        )
 
     def value(
         self,
-        node_features: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
+        critic_node_features: torch.Tensor,
+        critic_edge_index: torch.Tensor,
+        critic_edge_attr: torch.Tensor,
     ) -> torch.Tensor:
-        return self.critic(node_features, edge_index, edge_attr)
+        return self.critic(critic_node_features, critic_edge_index, critic_edge_attr)
 
     def evaluate_actions(
         self,
-        node_features: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
+        actor_ego_node_features: torch.Tensor,
+        actor_ego_edge_index: torch.Tensor,
+        actor_ego_edge_attr: torch.Tensor,
+        critic_node_features: torch.Tensor,
+        critic_edge_index: torch.Tensor,
+        critic_edge_attr: torch.Tensor,
         actions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        log_probs, entropy = self.actor.evaluate_actions(node_features, edge_index, edge_attr, actions)
-        values = self.critic(node_features, edge_index, edge_attr)
+        log_probs, entropy = self.actor.evaluate_actions(
+            actor_ego_node_features,
+            actor_ego_edge_index,
+            actor_ego_edge_attr,
+            actions,
+        )
+        values = self.critic(critic_node_features, critic_edge_index, critic_edge_attr)
         return log_probs, entropy, values

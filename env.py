@@ -206,9 +206,15 @@ class MultiUAV2DEnv:
 
         # Graph-observation dimensions for GNN MAPPO.
         # node_features_i = [lidar_i, ego_motion_i, assigned_target_i]
-        # edge_attr_ij = [dx_ij, dy_ij, distance_ij, bearing_ij]
+        # edge_attr_ij = [dx_ij, dy_ij, distance_ij, bearing_ij, edge_mask]
+        #
+        # edge_mask supports CTDE-style GNN training:
+        # - actor graph: mask=1 only for communication-range neighbors, otherwise 0.
+        # - critic graph: mask=1 for every directed pair, so critic sees a global graph.
+        # Keeping fixed edge slots gives batchable tensors while still blocking
+        # non-communicating neighbors from contributing messages to the actor.
         self.node_dim = self.cfg.lidar_num_rays + 4 + 2
-        self.edge_dim = 4
+        self.edge_dim = 5
 
         self.target_assigner = target_assigner or build_assigner(self.cfg.assigner_name)
         self.assignment_info: Dict = {}
@@ -814,13 +820,11 @@ class MultiUAV2DEnv:
             )
         return obs.astype(np.float32)
 
-    def get_graph_obs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return graph observation for GNN-based MAPPO.
+    def _build_graph_node_features(self) -> np.ndarray:
+        """Build fixed-dimensional UAV node features for graph policies.
 
-        Returns:
-            node_features: [num_agents, node_dim] — LiDAR + ego + target.
-            edge_index: [2, num_edges] — directed fully connected, no self-loops.
-            edge_attr: [num_edges, edge_dim] — [dx, dy, dist, bearing] normalized.
+        Returns node_features with shape [num_agents, node_dim]:
+            [LiDAR distances, ego velocity/acceleration, assigned-target range/bearing]
         """
         lidar_obs = self._compute_lidar_observations()
         ego_obs = self._compute_ego_motion_observations()
@@ -833,11 +837,109 @@ class MultiUAV2DEnv:
                 f"expected {(self.num_agents, self.node_dim)}."
             )
 
-        edge_index, edge_attr = self._build_agent_graph()
+        return node_features
+
+    def get_actor_ego_graph_obs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return strict decentralized actor ego graphs.
+
+        One ego graph is built for each controlled UAV i:
+            local node 0      = UAV i itself
+            local nodes 1..   = padded slots for the other UAVs
+
+        Communication-range neighbors keep their real node features and active
+        edge mask. Non-neighbors are zero-padded and have edge_mask=0, so the
+        actor cannot use their state.
+
+        Returns:
+            ego_node_features: [num_agents, ego_num_nodes, node_dim]
+            ego_edge_index: [2, ego_num_edges], shared by all ego graphs
+            ego_edge_attr: [num_agents, ego_num_edges, edge_dim]
+        """
+        all_node_features = self._build_graph_node_features()
+        return self._build_actor_ego_graphs(all_node_features)
+
+    def get_actor_graph_obs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Backward-compatible alias for strict actor ego graphs."""
+        return self.get_actor_ego_graph_obs()
+
+    def get_critic_graph_obs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return the centralized critic full graph.
+
+        The critic is allowed to use the full UAV interaction graph during
+        training. Every directed UAV-UAV edge has edge_mask=1.
+        """
+        node_features = self._build_graph_node_features()
+        edge_index, edge_attr = self._build_agent_graph(full_graph=True)
         return node_features, edge_index, edge_attr
 
-    def _build_agent_graph(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Build a directed fully connected graph over UAV agents."""
+    def get_graph_obs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Backward-compatible alias for strict actor ego graphs."""
+        return self.get_actor_ego_graph_obs()
+
+    def _build_actor_ego_graphs(
+        self,
+        all_node_features: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Build one padded star-shaped ego graph per UAV for the actor."""
+        n = self.num_agents
+        ego_num_nodes = n
+        ego_num_edges = max(n - 1, 0)
+
+        # Local ego graph convention:
+        #   node 0 is the center UAV;
+        #   local nodes 1..n-1 are slots for all other UAVs;
+        #   edges are slot -> 0, so only neighbors can send messages to center.
+        if ego_num_edges > 0:
+            src = np.arange(1, n, dtype=np.int64)
+            dst = np.zeros((ego_num_edges,), dtype=np.int64)
+            ego_edge_index = np.stack([src, dst], axis=0)
+        else:
+            ego_edge_index = np.zeros((2, 0), dtype=np.int64)
+
+        ego_node_features = np.zeros((n, ego_num_nodes, self.node_dim), dtype=np.float32)
+        ego_edge_attr = np.zeros((n, ego_num_edges, self.edge_dim), dtype=np.float32)
+
+        world_scale = max(float(self.cfg.world_size), 1e-6)
+        comm_scale = max(float(self.cfg.communication_range), 1e-6)
+
+        for center_id in range(n):
+            ego_node_features[center_id, 0] = all_node_features[center_id]
+            slot = 1
+            for other_id in range(n):
+                if other_id == center_id:
+                    continue
+
+                rel = self.positions[other_id] - self.positions[center_id]
+                dx = float(rel[0] / world_scale)
+                dy = float(rel[1] / world_scale)
+                dist = float(np.linalg.norm(rel))
+                dist_norm = dist / comm_scale
+
+                bearing = np.arctan2(rel[1], rel[0]) - self.headings[center_id]
+                bearing_norm = float(self._wrap_angle(bearing) / np.pi)
+
+                active = 1.0 if dist <= self.cfg.communication_range else 0.0
+                if active > 0.0:
+                    ego_node_features[center_id, slot] = all_node_features[other_id]
+
+                ego_edge_attr[center_id, slot - 1] = [
+                    dx,
+                    dy,
+                    dist_norm,
+                    bearing_norm,
+                    active,
+                ]
+                slot += 1
+
+        return ego_node_features, ego_edge_index, ego_edge_attr
+
+    def _build_agent_graph(self, full_graph: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """Build a directed UAV graph with fixed edge_index and a message mask.
+
+        full_graph=True is used by the critic: every directed edge is active.
+        full_graph=False keeps all directed edge slots but masks edges outside
+        communication range.
+        """
         src_list, dst_list, edge_attrs = [], [], []
 
         world_scale = max(float(self.cfg.world_size), 1e-6)
@@ -857,9 +959,14 @@ class MultiUAV2DEnv:
                 bearing = np.arctan2(rel[1], rel[0]) - self.headings[i]
                 bearing_norm = float(self._wrap_angle(bearing) / np.pi)
 
+                if full_graph:
+                    edge_mask = 1.0
+                else:
+                    edge_mask = 1.0 if dist <= self.cfg.communication_range else 0.0
+
                 src_list.append(i)
                 dst_list.append(j)
-                edge_attrs.append([dx, dy, dist_norm, bearing_norm])
+                edge_attrs.append([dx, dy, dist_norm, bearing_norm, edge_mask])
 
         edge_index = np.asarray([src_list, dst_list], dtype=np.int64)
         edge_attr = np.asarray(edge_attrs, dtype=np.float32)
