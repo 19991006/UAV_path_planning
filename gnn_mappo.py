@@ -35,7 +35,6 @@ class GraphMAPPOAgent:
         self.num_agents = self.env.num_agents
         self.node_dim = int(node_features.shape[1])
         self.edge_dim = int(edge_attr.shape[1])
-        self.num_edges = int(edge_attr.shape[0])
         self.action_dim = self.env.action_dim
 
         network_config = GraphNetworkConfig(
@@ -65,13 +64,12 @@ class GraphMAPPOAgent:
             num_agents=self.num_agents,
             node_dim=self.node_dim,
             edge_dim=self.edge_dim,
-            num_edges=self.num_edges,
             action_dim=self.action_dim,
             gamma=self.cfg.gamma,
             gae_lambda=self.cfg.gae_lambda,
             device=str(self.device),
         )
-        self.buffer = GraphRolloutBuffer(buffer_config, edge_index=edge_index)
+        self.buffer = GraphRolloutBuffer(buffer_config)
 
         self.total_env_steps = 0
         self.num_updates = 0
@@ -125,6 +123,7 @@ class GraphMAPPOAgent:
 
             self.buffer.add(
                 node_features=node_features,
+                edge_index=edge_index,
                 edge_attr=edge_attr,
                 actions=actions,
                 log_probs=log_probs,
