@@ -70,6 +70,26 @@ class TanhNormal:
         return self.normal.entropy().sum(dim=-1)
 
 
+def scatter_mean(src: torch.Tensor, index: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    """Compute mean of src elements grouped by index (like PyG's scatter_mean).
+
+    Args:
+        src:  [N, ...] source tensor
+        index: [N] integer group indices (0-based contiguous)
+        dim:   dimension to scatter over (default 0)
+    Returns:
+        out: [num_groups, ...]
+    """
+    num_groups = int(index.max().item()) + 1
+    out = src.new_zeros(num_groups, *src.shape[1:])
+    count = src.new_zeros(num_groups, *src.shape[1:])
+    index_expanded = index.unsqueeze(-1).expand_as(src) if src.dim() > 1 else index
+    out.scatter_add_(dim, index_expanded, src)
+    ones = torch.ones_like(src)
+    count.scatter_add_(dim, index_expanded, ones)
+    return out / count.clamp_min(1.0)
+
+
 def get_activation(name: str) -> type[nn.Module]:
     name = name.lower()
     if name == "tanh":
@@ -246,22 +266,24 @@ class GraphCritic(nn.Module):
         node_features: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
+        batch: torch.Tensor,
     ) -> torch.Tensor:
-        squeeze_batch = False
-        if node_features.dim() == 2:
-            node_features = node_features.unsqueeze(0)
-            if edge_attr.dim() == 2:
-                edge_attr = edge_attr.unsqueeze(0)
-            squeeze_batch = True
+        """Returns V(s) for each graph in the batch.
 
+        Args:
+            node_features: [N_total, node_dim]
+            edge_index:    [2, E_total]
+            edge_attr:     [E_total, edge_dim]
+            batch:         [N_total] — batch[i] = graph index for node i
+        Returns:
+            value: [num_graphs]
+        """
         h = self.node_encoder(node_features)
         for layer in self.gnn_layers:
             h = layer(h, edge_index, edge_attr)
 
-        graph_embedding = h.mean(dim=1)  # [B, H], stable across different N.
-        value = self.value_head(graph_embedding).squeeze(-1)
-        if squeeze_batch:
-            value = value.squeeze(0)
+        graph_embedding = scatter_mean(h, batch, dim=0)  # [num_graphs, H]
+        value = self.value_head(graph_embedding).squeeze(-1)   # [num_graphs]
         return value
 
 
@@ -287,8 +309,9 @@ class GraphActorCritic(nn.Module):
         node_features: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
+        batch: torch.Tensor,
     ) -> torch.Tensor:
-        return self.critic(node_features, edge_index, edge_attr)
+        return self.critic(node_features, edge_index, edge_attr, batch)
 
     def evaluate_actions(
         self,
@@ -296,7 +319,8 @@ class GraphActorCritic(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         actions: torch.Tensor,
+        batch: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         log_probs, entropy = self.actor.evaluate_actions(node_features, edge_index, edge_attr, actions)
-        values = self.critic(node_features, edge_index, edge_attr)
+        values = self.critic(node_features, edge_index, edge_attr, batch)
         return log_probs, entropy, values
