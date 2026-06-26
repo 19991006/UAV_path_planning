@@ -837,7 +837,10 @@ class MultiUAV2DEnv:
         return node_features, edge_index, edge_attr
 
     def _build_agent_graph(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Build a directed fully connected graph over UAV agents."""
+        """Build a directed distance-based graph over UAV agents.
+
+        An edge i->j exists only when ||pos_j - pos_i|| <= communication_range.
+        """
         src_list, dst_list, edge_attrs = [], [], []
 
         world_scale = max(float(self.cfg.world_size), 1e-6)
@@ -852,6 +855,10 @@ class MultiUAV2DEnv:
                 dx = float(rel[0] / world_scale)
                 dy = float(rel[1] / world_scale)
                 dist = float(np.linalg.norm(rel))
+
+                if dist > self.cfg.communication_range:
+                    continue
+
                 dist_norm = dist / comm_scale
 
                 bearing = np.arctan2(rel[1], rel[0]) - self.headings[i]
@@ -860,6 +867,12 @@ class MultiUAV2DEnv:
                 src_list.append(i)
                 dst_list.append(j)
                 edge_attrs.append([dx, dy, dist_norm, bearing_norm])
+
+        if len(src_list) == 0:
+            return (
+                np.empty((2, 0), dtype=np.int64),
+                np.empty((0, self.edge_dim), dtype=np.float32),
+            )
 
         edge_index = np.asarray([src_list, dst_list], dtype=np.int64)
         edge_attr = np.asarray(edge_attrs, dtype=np.float32)
