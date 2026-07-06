@@ -458,7 +458,7 @@ class EGTAPTargetAssigner(BaseTargetAssigner):
     Computational complexity: O(2m) per iteration, independent of N.
     """
 
-    def __init__(self, step_size: float = 0.01, max_iterations: int = 500,
+    def __init__(self, step_size: float = 0.05, max_iterations: int = 500,
                  squared_distance: bool = True):
         self.alpha = step_size
         self.max_iterations = max_iterations
