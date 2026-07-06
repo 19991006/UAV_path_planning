@@ -447,6 +447,108 @@ class CBAATargetAssigner(BaseTargetAssigner):
         return assignments, cost_matrix, info
 
 
+class EGTAPTargetAssigner(BaseTargetAssigner):
+    """Extra-Gradient Task Assignment (EG-TAP) via saddle-point dynamics.
+
+    Algorithm 2 from Huang, Kuai, Cui, Meng & Sun (2024).
+    Distributed optimisation — each agent i maintains states
+    (x_i, y_i, mu_i, lambda_i) and exchanges y_i, mu_i with neighbours.
+
+    Computes a conflict-free one-to-one assignment with O(1/k) convergence.
+    Computational complexity: O(2m) per iteration, independent of N.
+    """
+
+    def __init__(self, step_size: float = 0.01, max_iterations: int = 500,
+                 squared_distance: bool = True):
+        self.alpha = step_size
+        self.max_iterations = max_iterations
+        self.squared_distance = squared_distance
+
+    def assign(
+        self,
+        agent_positions: np.ndarray,
+        target_positions: np.ndarray,
+        **kwargs,
+    ) -> AssignmentResult:
+        HungarianTargetAssigner._validate_inputs(agent_positions, target_positions)
+
+        n = agent_positions.shape[0]   # N agents
+        m = target_positions.shape[0]  # m tasks
+
+        # -- cost vectors  c[i][j] = dist^2, normalized to [0,1] ------
+        diff = agent_positions[:, None, :] - target_positions[None, :, :]
+        dist_sq = np.sum(diff ** 2, axis=-1)
+        if self.squared_distance:
+            raw_c = dist_sq.astype(np.float32)
+        else:
+            raw_c = np.sqrt(dist_sq + 1e-8).astype(np.float32)
+        c_max = float(np.max(raw_c))
+        c = (raw_c / c_max).astype(np.float32) if c_max > 0 else raw_c
+
+        # -- communication graph & Laplacian --------------------------
+        comm = kwargs.get("communication_graph", None)
+        if comm is not None:
+            adj = np.asarray(comm, dtype=np.float32)
+        else:
+            adj = np.ones((n, n), dtype=np.float32)
+            np.fill_diagonal(adj, 0.0)
+
+        degree = adj.sum(axis=1)
+        L = np.diag(degree) - adj          # Laplacian: N×N
+        L = L.astype(np.float32)
+
+        # -- initialise states ----------------------------------------
+        x = np.zeros((n, m), dtype=np.float32)
+        y = np.zeros((n, m), dtype=np.float32)
+        mu = np.zeros((n, m), dtype=np.float32)
+        lam = np.zeros((n, 1), dtype=np.float32)
+
+        alpha = self.alpha
+        ones_over_N = np.ones((1, m), dtype=np.float32) / float(n)
+
+        for _ in range(self.max_iterations):
+            # ---- Step 1: midpoint (Eq 9) ----------------------------
+            x_mid = np.clip(x - alpha * (c - mu + lam), 0.0, 1.0)        # 9a
+            y_mid = y + alpha * (L @ mu)                                  # 9b
+            mu_mid = np.maximum(
+                0.0,
+                mu + alpha * (ones_over_N - x - (L @ (y + mu))),          # 9c
+            )
+            lam_mid = lam + alpha * (x.sum(axis=1, keepdims=True) - 1.0)  # 9d
+
+            # ---- Step 2: next iterate (Eq 10) -----------------------
+            x_next = np.clip(x - alpha * (c - mu_mid + lam_mid), 0.0, 1.0)  # 10a
+            y_next = y + alpha * (L @ mu_mid)                                 # 10b
+            mu_next = np.maximum(
+                0.0,
+                mu + alpha * (ones_over_N - x_mid - (L @ (y_mid + mu_mid))),  # 10c
+            )
+            lam_next = lam + alpha * (x_mid.sum(axis=1, keepdims=True) - 1.0)  # 10d
+
+            x, y, mu, lam = x_next, y_next, mu_next, lam_next
+
+        # -- discretise: argmax per agent -----------------------------
+        assignments = np.argmax(x, axis=1).astype(np.int64)
+
+        # Validate: every agent assigned a unique task
+        if np.any(assignments < 0) or len(set(assignments)) < n:
+            raise RuntimeError(
+                f"EG-TAP did not converge to a conflict-free assignment "
+                f"within {self.max_iterations} iterations. "
+                f"Try reducing step_size or increasing max_iterations."
+            )
+
+        # -- diagnostics ----------------------------------------------
+        cost_matrix = dist_sq.astype(np.float32)
+        total_cost = float(sum(cost_matrix[i, assignments[i]] for i in range(n)))
+        info = {
+            "assigner": "eg-tap",
+            "total_assignment_cost": total_cost,
+            "iterations": self.max_iterations,
+        }
+        return assignments, cost_matrix, info
+
+
 def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
     """
     Factory function for convenient config-based construction.
@@ -467,6 +569,8 @@ def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
         return CrossTargetAssigner()
     if name in {"cbaa", "cbba", "consensus_bundle", "auction"}:
         return CBAATargetAssigner(**kwargs)
+    if name in {"egtap", "eg-tap"}:
+        return EGTAPTargetAssigner(**kwargs)
     raise ValueError(f"Unknown assigner name: {name}")
 
 
@@ -483,7 +587,7 @@ if __name__ == "__main__":
         [8.0, 4.0],
     ], dtype=np.float32)
 
-    for method in ["fixed", "greedy", "hungarian", "cbaa"]:
+    for method in ["fixed", "greedy", "hungarian", "cbaa", "egtap"]:
         assigner = build_assigner(method)
         assignments, cost_matrix, info = assigner.assign(agents, targets)
         print(f"\nMethod: {method}")
