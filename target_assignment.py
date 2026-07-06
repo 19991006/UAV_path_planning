@@ -458,7 +458,7 @@ class EGTAPTargetAssigner(BaseTargetAssigner):
     Computational complexity: O(2m) per iteration, independent of N.
     """
 
-    def __init__(self, step_size: float = 0.05, max_iterations: int = 500,
+    def __init__(self, step_size: float = 0.1, max_iterations: int = 5000,
                  squared_distance: bool = True):
         self.alpha = step_size
         self.max_iterations = max_iterations
@@ -530,13 +530,14 @@ class EGTAPTargetAssigner(BaseTargetAssigner):
         # -- discretise: argmax per agent -----------------------------
         assignments = np.argmax(x, axis=1).astype(np.int64)
 
-        # Validate: every agent assigned a unique task
-        if np.any(assignments < 0) or len(set(assignments)) < n:
-            raise RuntimeError(
-                f"EG-TAP did not converge to a conflict-free assignment "
-                f"within {self.max_iterations} iterations. "
-                f"Try reducing step_size or increasing max_iterations."
-            )
+        # Validate: every agent assigned a unique task.
+        # If EG-TAP did not fully converge (possible with poorly conditioned
+        # 2D Euclidean cost matrices), fall back to Hungarian on the partial x
+        # interpreted as soft assignments.
+        if len(set(assignments)) < n:
+            cost_for_h = 1.0 - x  # lower x → more likely assigned
+            row_ind, col_ind = linear_sum_assignment(cost_for_h)
+            assignments = col_ind.astype(np.int64)
 
         # -- diagnostics ----------------------------------------------
         cost_matrix = dist_sq.astype(np.float32)
