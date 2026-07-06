@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=600,
                         help="Max environment steps per episode before timeout")
     parser.add_argument("--assigner-name", type=str, default="fixed",
-                        choices=["hungarian", "greedy", "fixed", "cross", "cbba"],
+                        choices=["hungarian", "greedy", "fixed", "cross", "cbba", "cbba_auction", "admm"],
                         help="Online target assignment algorithm")
     parser.add_argument("--reassign-interval", type=int, default=10,
                         help="Steps between full reassignments (1 = every step)")

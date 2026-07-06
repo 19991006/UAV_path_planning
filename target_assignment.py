@@ -44,6 +44,10 @@ class CBBAConfig:
         max_dist_sq: Maximum squared distance between any agent-target pair.
             Used to convert distances to non-negative rewards. If None, computed
             automatically from agent/target positions at assign() time.
+        bid_strategy: "distance_reward" keeps the original distance-reward bid.
+            "opportunity_auction" uses an auction-style opportunity-cost bid.
+        auction_epsilon: Small positive increment for opportunity auction bids.
+            If None, use a scale-aware default from max_dist_sq at assign() time.
     """
     L_t: int = 1
     max_iterations: int = 50
@@ -51,6 +55,8 @@ class CBBAConfig:
     communication_graph: Optional[np.ndarray] = None
     squared_distance: bool = True
     max_dist_sq: Optional[float] = None
+    bid_strategy: str = "distance_reward"
+    auction_epsilon: Optional[float] = 1e-3
 
 
 class BaseTargetAssigner(ABC):
@@ -359,6 +365,66 @@ class CBBAAgent:
         gain = best_score - current_score
         return gain, best_pos
 
+    def _single_task_utility(self, task_j: int) -> float:
+        return self._path_score([task_j])
+
+    def _effective_auction_epsilon(self) -> float:
+        if self.cfg.auction_epsilon is not None:
+            return float(self.cfg.auction_epsilon)
+
+        reward_scale = max(float(self.max_dist_sq or 0.0), 1.0)
+        return max(1e-3, 1e-3 * reward_scale)
+
+    def _opportunity_auction_bid(self, task_j: int) -> Tuple[float, int]:
+        """Auction bid using opportunity cost against the next-best target.
+
+        y[j] acts as the current target price in this mode.  An agent bids only
+        on its best net-value target, raising that target's price by the gap to
+        its second-best option plus epsilon.
+        """
+        utilities = np.array(
+            [self._single_task_utility(j) for j in range(self.num_targets)],
+            dtype=np.float32,
+        )
+        net_values = utilities - self.y
+        order = sorted(
+            range(self.num_targets),
+            key=lambda j: (-float(net_values[j]), int(j)),
+        )
+        if not order or task_j != order[0]:
+            return -float("inf"), 0
+
+        best_net = float(net_values[order[0]])
+        second_net = float(net_values[order[1]]) if len(order) > 1 else best_net
+        bid_increment = max(best_net - second_net, 0.0) + self._effective_auction_epsilon()
+        return float(self.y[task_j]) + bid_increment, 0
+
+    def _candidate_bid(self, task_j: int) -> Tuple[float, int]:
+        if self.cfg.bid_strategy == "distance_reward":
+            return self._marginal_gain(task_j)
+        if self.cfg.bid_strategy == "opportunity_auction":
+            return self._opportunity_auction_bid(task_j)
+        raise ValueError(f"Unknown CBBA bid_strategy: {self.cfg.bid_strategy}")
+
+    @staticmethod
+    def _bid_wins(
+        candidate_bid: float,
+        candidate_agent: int,
+        incumbent_bid: float,
+        incumbent_agent: int,
+        eps: float = 1e-6,
+    ) -> bool:
+        """Return True when a candidate bid should replace the incumbent."""
+        if candidate_agent < 0:
+            return False
+        if incumbent_agent < 0:
+            return True
+        if candidate_bid > incumbent_bid + eps:
+            return True
+        if abs(candidate_bid - incumbent_bid) <= eps:
+            return candidate_agent < incumbent_agent
+        return False
+
     def build_bundle(self) -> bool:
         """Phase 1: Bundle construction (Algorithm 3 in the paper).
 
@@ -378,13 +444,22 @@ class CBBAAgent:
             for j in range(self.num_targets):
                 if j in self.b:
                     continue
-                gain, insert_pos = self._marginal_gain(j)
+                gain, insert_pos = self._candidate_bid(j)
 
-                # Equation (2): h_ij = I(c_ij > y_ij)
-                if gain <= 0.0 or gain <= self.y[j]:
+                # Equation (2): h_ij = I(c_ij > y_ij), with deterministic
+                # tie-breaking so equal bids do not keep conflicting forever.
+                if gain < -1e-6 or not self._bid_wins(
+                    gain,
+                    self.agent_id,
+                    float(self.y[j]),
+                    int(self.z[j]),
+                ):
                     continue
 
-                if gain > best_gain:
+                if (
+                    gain > best_gain + 1e-6
+                    or (abs(gain - best_gain) <= 1e-6 and (best_task < 0 or j < best_task))
+                ):
                     best_gain = gain
                     best_task = j
                     best_pos = insert_pos
@@ -575,6 +650,16 @@ class CBBATargetAssigner(BaseTargetAssigner):
         **kwargs,
     ) -> AssignmentResult:
         HungarianTargetAssigner._validate_inputs(agent_positions, target_positions)
+        if self.cfg.bid_strategy not in {"distance_reward", "opportunity_auction"}:
+            raise ValueError(f"Unknown CBBA bid_strategy: {self.cfg.bid_strategy}")
+        if self.cfg.auction_epsilon is not None and self.cfg.auction_epsilon <= 0:
+            raise ValueError("auction_epsilon must be positive or None for adaptive scaling.")
+        if self.cfg.bid_strategy == "opportunity_auction" and (
+            self.cfg.L_t != 1 or self.cfg.use_timestamps
+        ):
+            raise ValueError(
+                "opportunity_auction currently supports only L_t=1 and use_timestamps=False."
+            )
 
         num_agents = agent_positions.shape[0]
         num_targets = target_positions.shape[0]
@@ -598,19 +683,26 @@ class CBBATargetAssigner(BaseTargetAssigner):
 
         # Build communication graph: config > kwargs > fully-connected default
         if self.cfg.communication_graph is not None:
-            adj = np.asarray(self.cfg.communication_graph)
+            adj = np.asarray(self.cfg.communication_graph, dtype=bool)
         elif "communication_graph" in kwargs and kwargs["communication_graph"] is not None:
-            adj = np.asarray(kwargs["communication_graph"])
+            adj = np.asarray(kwargs["communication_graph"], dtype=bool)
         else:
             adj = np.ones((num_agents, num_agents), dtype=bool)
             np.fill_diagonal(adj, False)
+        if adj.shape != (num_agents, num_agents):
+            raise ValueError(
+                f"communication_graph must have shape {(num_agents, num_agents)}, got {adj.shape}."
+            )
+        np.fill_diagonal(adj, False)
+        comm_connected = self._is_connected(adj)
 
         # 2. Iterate Phase 1 <-> Phase 2 until convergence
         iteration = 0
         for iteration in range(self.cfg.max_iterations):
             # Phase 1: Bundle construction
+            bundle_changed = False
             for agent in agents:
-                agent.build_bundle()
+                bundle_changed = agent.build_bundle() or bundle_changed
 
             if self.cfg.L_t == 1 and not self.cfg.use_timestamps:
                 # CBAA Phase 2 — Algorithm 2 from Choi et al. (2009).
@@ -621,39 +713,46 @@ class CBBATargetAssigner(BaseTargetAssigner):
                 # Snapshot all y vectors first so that the winner check uses
                 # Phase-1 values, not values already updated by max-consensus.
 
-                # --- Snapshot ---
                 y_snapshot = [a.y.copy() for a in agents]
+                z_snapshot = [a.z.copy() for a in agents]
                 prev_bundles = [list(a.b) for a in agents]
+                consensus_changed = False
 
-                # --- Max-consensus (Line 3-4) ---
                 for i in range(num_agents):
-                    best = y_snapshot[i].copy()
-                    for k in range(num_agents):
-                        if adj[i, k]:
-                            best = np.maximum(best, y_snapshot[k])
-                    agents[i].y = best
+                    for j in range(num_targets):
+                        best_bid = float(y_snapshot[i][j])
+                        best_agent = int(z_snapshot[i][j])
+                        for k in range(num_agents):
+                            if not adj[i, k]:
+                                continue
+                            candidate_bid = float(y_snapshot[k][j])
+                            candidate_agent = int(z_snapshot[k][j])
+                            if CBBAAgent._bid_wins(
+                                candidate_bid,
+                                candidate_agent,
+                                best_bid,
+                                best_agent,
+                            ):
+                                best_bid = candidate_bid
+                                best_agent = candidate_agent
+                        agents[i].y[j] = best_bid
+                        agents[i].z[j] = best_agent
+                        if (
+                            abs(best_bid - float(y_snapshot[i][j])) > 1e-6
+                            or best_agent != int(z_snapshot[i][j])
+                        ):
+                            consensus_changed = True
 
-                # --- Winner check (Lines 5-8) using snapshot ---
+                released = False
                 for i in range(num_agents):
                     if not agents[i].b:
                         continue
                     task_j = agents[i].b[0]
-
-                    best_agent = i
-                    best_bid = y_snapshot[i][task_j]
-                    for k in range(num_agents):
-                        if not adj[i, k]:
-                            continue
-                        if y_snapshot[k][task_j] > best_bid:
-                            best_bid = y_snapshot[k][task_j]
-                            best_agent = k
-
-                    if best_agent != i:
-                        agents[i].y[task_j] = 0.0
-                        agents[i].z[task_j] = -1
+                    if agents[i].z[task_j] != i:
                         agents[i].b = []
                         agents[i].p = []
                         agents[i].total_score = 0.0
+                        released = True
 
                 # Convergence or early exit.
                 if self._is_converged_cbaa(agents, num_agents):
@@ -664,7 +763,7 @@ class CBBATargetAssigner(BaseTargetAssigner):
                 bundles_unchanged = all(
                     list(a.b) == prev_bundles[idx] for idx, a in enumerate(agents)
                 )
-                if bundles_unchanged:
+                if bundles_unchanged and not bundle_changed and not released and not consensus_changed:
                     break
             else:
                 # CBBA Phase 2 — Table I pairwise consensus.
@@ -688,6 +787,17 @@ class CBBATargetAssigner(BaseTargetAssigner):
         diff = agent_positions[:, None, :] - target_positions[None, :, :]
         cost_matrix = np.sum(diff ** 2, axis=-1).astype(np.float32)
 
+        algorithm_mode = (
+            "cbaa_single_task"
+            if self.cfg.L_t == 1 and not self.cfg.use_timestamps
+            else "cbba_bundle"
+        )
+        converged = (
+            self._is_converged_cbaa(agents, num_agents)
+            if algorithm_mode == "cbaa_single_task"
+            else self._is_converged(agents, num_agents)
+        )
+
         # 4. Build output assignments
         assignments = np.full(num_agents, -1, dtype=np.int64)
         for i, agent in enumerate(agents):
@@ -697,7 +807,12 @@ class CBBATargetAssigner(BaseTargetAssigner):
         # Resolve remaining conflicts / unassigned agents greedily.
         assigned_mask = assignments >= 0
         _, counts = np.unique(assignments[assigned_mask], return_counts=True)
-        if np.any(counts > 1) or np.any(~assigned_mask):
+        has_conflict = bool(np.any(counts > 1))
+        has_unassigned = bool(np.any(~assigned_mask))
+        used_fallback = has_conflict or has_unassigned
+        fallback_reason = None
+        if used_fallback:
+            fallback_reason = "conflict" if has_conflict else "unassigned"
             claimed = set()
             clean = np.full(num_agents, -1, dtype=np.int64)
             order = np.argsort(cost_matrix.min(axis=1))
@@ -718,13 +833,52 @@ class CBBATargetAssigner(BaseTargetAssigner):
             )
 
         total_cost = float(sum(cost_matrix[i, assignments[i]] for i in range(num_agents)))
+        effective_auction_epsilon = (
+            agents[0]._effective_auction_epsilon()
+            if self.cfg.bid_strategy == "opportunity_auction"
+            else self.cfg.auction_epsilon
+        )
         info = {
-            "assigner": "cbba",
+            "assigner": (
+                "cbba_auction"
+                if self.cfg.bid_strategy == "opportunity_auction"
+                else "cbba"
+            ),
+            "algorithm_mode": algorithm_mode,
+            "bid_strategy": self.cfg.bid_strategy,
+            "auction_epsilon": (
+                None
+                if effective_auction_epsilon is None
+                else float(effective_auction_epsilon)
+            ),
+            "auction_epsilon_adaptive": bool(
+                self.cfg.bid_strategy == "opportunity_auction"
+                and self.cfg.auction_epsilon is None
+            ),
             "total_assignment_cost": total_cost,
             "iterations": iteration + 1,
-            "converged": self._is_converged_cbaa(agents, num_agents),
+            "converged": bool(converged and comm_connected),
+            "comm_connected": bool(comm_connected),
+            "used_fallback": bool(used_fallback),
+            "fallback_reason": fallback_reason,
         }
         return assignments, cost_matrix, info
+
+    @staticmethod
+    def _is_connected(adj: np.ndarray) -> bool:
+        n = adj.shape[0]
+        if n <= 1:
+            return True
+        seen = {0}
+        stack = [0]
+        while stack:
+            i = stack.pop()
+            for j in np.flatnonzero(adj[i]):
+                j = int(j)
+                if j not in seen:
+                    seen.add(j)
+                    stack.append(j)
+        return len(seen) == n
 
     @staticmethod
     def _is_converged(agents: list[CBBAAgent], num_agents: int) -> bool:
@@ -750,13 +904,423 @@ class CBBATargetAssigner(BaseTargetAssigner):
             return False
         # No two agents may claim the same task.
         claimed = set()
-        for a in agents:
+        for i, a in enumerate(agents):
             task_j = a.b[0]
             if task_j in claimed:
+                return False
+            if a.z[task_j] != i:
                 return False
             claimed.add(task_j)
         return True
 
+
+
+@dataclass
+class DistributedADMMConfig:
+    """Configuration for DistributedADMMTargetAssigner.
+
+    This assigner is intended for the N-UAV / N-target case.  It first runs a
+    decentralized consensus-ADMM style continuous relaxation over local copies
+    of the global assignment matrix, then converts the relaxed matrix into a
+    discrete one-to-one assignment using distributed conflict resolution.
+
+    Args:
+        max_iterations: Number of inner ADMM message-passing iterations per
+            environment reassignment.
+        rho: ADMM penalty parameter. Larger values emphasize neighbor
+            consistency; smaller values emphasize the local distance cost.
+        sinkhorn_iterations: Number of row/column normalization steps used to
+            project a matrix to the doubly stochastic relaxation.
+        temperature: Softness of the Sinkhorn projection. Smaller values make
+            the relaxed matrix closer to a permutation matrix, but may be less
+            stable.
+        conflict_rounds: Maximum number of winner/loser conflict-resolution
+            rounds after ADMM.
+        squared_distance: Whether to use squared Euclidean distance as the cost.
+        use_warm_start: Reuse the previous relaxed assignment matrix when the
+            environment calls assign() again. This is useful for dynamic targets.
+        convergence_tol: Stop ADMM when local copies change by less than this value.
+        allow_global_safety_repair: If True, repair invalid/disconnected results
+            with a centralized safety pass so the simulator state remains valid.
+        eps: Numerical stability constant.
+    """
+
+    max_iterations: int = 30
+    rho: float = 2.0
+    sinkhorn_iterations: int = 30
+    temperature: float = 0.2
+    conflict_rounds: int = 20
+    squared_distance: bool = True
+    use_warm_start: bool = True
+    convergence_tol: float = 1e-4
+    allow_global_safety_repair: bool = True
+    eps: float = 1e-8
+
+
+class DistributedADMMTargetAssigner(BaseTargetAssigner):
+    """Distributed ADMM + distributed conflict resolution target assigner.
+
+    The environment calls this class exactly like the existing Hungarian / CBBA
+    assigners.  Internally, the method emulates one communication period of a
+    decentralized algorithm:
+
+    1. Each UAV i owns a local copy X_i of the full assignment matrix X.
+    2. UAV i only puts its own cost row C[i, :] into the local objective.
+    3. Neighboring UAVs enforce X_i = X_k with consensus-ADMM edge variables.
+    4. The averaged relaxed assignment matrix is discretized by local target
+       selection plus iterative conflict resolution.
+
+    Notes:
+        - This is a practical simulation implementation.  It uses the provided
+          communication_graph to restrict ADMM message passing.
+        - If the communication graph is disconnected, no purely local method can
+          guarantee global one-to-one assignment across disconnected components.
+          In that case, the final safety repair keeps the environment valid and
+          reports used_global_repair=True in info.
+    """
+
+    def __init__(self, config: Optional[DistributedADMMConfig] = None, **kwargs):
+        self.cfg = config or DistributedADMMConfig(**kwargs)
+        self._warm_X: Optional[np.ndarray] = None
+
+    def assign(
+        self,
+        agent_positions: np.ndarray,
+        target_positions: np.ndarray,
+        **kwargs,
+    ) -> AssignmentResult:
+        HungarianTargetAssigner._validate_inputs(agent_positions, target_positions)
+
+        num_agents = agent_positions.shape[0]
+        num_targets = target_positions.shape[0]
+        if num_agents != num_targets:
+            raise ValueError(
+                "DistributedADMMTargetAssigner currently assumes N agents and N targets. "
+                f"Got num_agents={num_agents}, num_targets={num_targets}."
+            )
+
+        cost_matrix = self._build_cost_matrix(agent_positions, target_positions)
+        cost_norm = self._normalize_cost(cost_matrix)
+
+        adj = self._build_adjacency(num_agents, kwargs.get("communication_graph", None))
+        connected = self._is_connected(adj)
+
+        relaxed_matrix, residual_trace, admm_converged = self._run_consensus_admm(cost_norm, adj)
+        assignments, conflict_info = self._distributed_conflict_resolution(
+            relaxed_matrix=relaxed_matrix,
+            cost_matrix=cost_matrix,
+            adj=adj,
+        )
+
+        distributed_assignment_valid = self._is_valid_assignment(assignments, num_agents)
+        used_global_safety_repair = False
+        repair_reason = None
+        resolution_scope = "connected_graph" if connected else "component_local"
+        if not connected:
+            repair_reason = "disconnected_graph"
+        elif not distributed_assignment_valid:
+            repair_reason = "conflict_resolution_failed"
+
+        if repair_reason is not None:
+            if not self.cfg.allow_global_safety_repair:
+                raise RuntimeError(
+                    "Distributed ADMM could not produce a guaranteed global one-to-one "
+                    f"assignment without safety repair. reason={repair_reason}."
+                )
+            assignments = self._global_safety_repair(relaxed_matrix, cost_matrix)
+            used_global_safety_repair = True
+            resolution_scope = "global_safety"
+
+        if self.cfg.use_warm_start:
+            # Store a permutation-like warm start matching the executable result.
+            self._warm_X = np.zeros((num_agents, num_targets), dtype=np.float32)
+            self._warm_X[np.arange(num_agents), assignments] = 1.0
+
+        total_cost = float(sum(cost_matrix[i, assignments[i]] for i in range(num_agents)))
+        info = {
+            "assigner": "distributed_admm_conflict",
+            "algorithm_mode": "distributed_admm_relaxation",
+            "total_assignment_cost": total_cost,
+            "admm_iterations": self.cfg.max_iterations,
+            "admm_iterations_actual": len(residual_trace),
+            "admm_converged": bool(admm_converged),
+            "rho": float(self.cfg.rho),
+            "temperature": float(self.cfg.temperature),
+            "comm_connected": bool(connected),
+            "used_distributed_conflict_resolution": True,
+            "used_global_repair": bool(used_global_safety_repair),
+            "used_global_safety_repair": bool(used_global_safety_repair),
+            "repair_reason": repair_reason,
+            "resolution_scope": resolution_scope,
+            "residual_last": float(residual_trace[-1]) if residual_trace else 0.0,
+            "residual_trace": residual_trace,
+            **conflict_info,
+        }
+        return assignments.astype(np.int64), cost_matrix.astype(np.float32), info
+
+    def _build_cost_matrix(self, agent_positions: np.ndarray, target_positions: np.ndarray) -> np.ndarray:
+        diff = agent_positions[:, None, :] - target_positions[None, :, :]
+        dist_sq = np.sum(diff ** 2, axis=-1)
+        if self.cfg.squared_distance:
+            return dist_sq.astype(np.float32)
+        return np.sqrt(dist_sq + self.cfg.eps).astype(np.float32)
+
+    def _normalize_cost(self, cost_matrix: np.ndarray) -> np.ndarray:
+        c_min = float(np.min(cost_matrix))
+        c_max = float(np.max(cost_matrix))
+        return ((cost_matrix - c_min) / (c_max - c_min + self.cfg.eps)).astype(np.float32)
+
+    @staticmethod
+    def _build_adjacency(num_agents: int, communication_graph: Optional[np.ndarray]) -> np.ndarray:
+        if communication_graph is None:
+            adj = np.ones((num_agents, num_agents), dtype=bool)
+            np.fill_diagonal(adj, False)
+            return adj
+        adj = np.asarray(communication_graph, dtype=bool).copy()
+        if adj.shape != (num_agents, num_agents):
+            raise ValueError(
+                f"communication_graph must have shape {(num_agents, num_agents)}, got {adj.shape}."
+            )
+        np.fill_diagonal(adj, False)
+        # Treat the communication link as undirected for pairwise ADMM exchange.
+        return adj | adj.T
+
+    @staticmethod
+    def _is_connected(adj: np.ndarray) -> bool:
+        n = adj.shape[0]
+        if n <= 1:
+            return True
+        seen = {0}
+        stack = [0]
+        while stack:
+            i = stack.pop()
+            for j in np.flatnonzero(adj[i]):
+                if int(j) not in seen:
+                    seen.add(int(j))
+                    stack.append(int(j))
+        return len(seen) == n
+
+    @staticmethod
+    def _connected_components(adj: np.ndarray) -> list[list[int]]:
+        n = adj.shape[0]
+        unseen = set(range(n))
+        components: list[list[int]] = []
+        while unseen:
+            start = unseen.pop()
+            component = [start]
+            stack = [start]
+            while stack:
+                i = stack.pop()
+                for j in np.flatnonzero(adj[i]):
+                    j = int(j)
+                    if j in unseen:
+                        unseen.remove(j)
+                        component.append(j)
+                        stack.append(j)
+            components.append(sorted(component))
+        return components
+
+    @staticmethod
+    def _components_are_locally_valid(assignments: np.ndarray, components: list[list[int]]) -> bool:
+        for component in components:
+            local_targets = [int(assignments[i]) for i in component]
+            if len(set(local_targets)) != len(local_targets):
+                return False
+        return True
+
+    def _initial_assignment_matrix(self, num_agents: int, num_targets: int) -> np.ndarray:
+        if (
+            self.cfg.use_warm_start
+            and self._warm_X is not None
+            and self._warm_X.shape == (num_agents, num_targets)
+        ):
+            return self._warm_X.astype(np.float32).copy()
+        return np.full((num_agents, num_targets), 1.0 / num_targets, dtype=np.float32)
+
+    def _run_consensus_admm(self, cost_norm: np.ndarray, adj: np.ndarray) -> Tuple[np.ndarray, list[float], bool]:
+        n, m = cost_norm.shape
+        X = np.stack([self._initial_assignment_matrix(n, m) for _ in range(n)], axis=0)
+
+        # Directed edge dual variables U[i, k] are only active when adj[i, k] is true.
+        U = np.zeros((n, n, n, m), dtype=np.float32)
+        Z = np.zeros((n, n, n, m), dtype=np.float32)
+        for i in range(n):
+            for k in np.flatnonzero(adj[i]):
+                Z[i, k] = 0.5 * (X[i] + X[int(k)])
+
+        residual_trace: list[float] = []
+        rho = max(float(self.cfg.rho), self.cfg.eps)
+        converged = False
+
+        for _ in range(self.cfg.max_iterations):
+            X_prev = X.copy()
+
+            # X-update: each agent solves an approximate local ADMM subproblem.
+            for i in range(n):
+                neighbors = np.flatnonzero(adj[i])
+                grad = np.zeros((n, m), dtype=np.float32)
+                grad[i, :] = cost_norm[i, :]
+
+                if len(neighbors) == 0:
+                    center = X[i]
+                    scale = rho
+                else:
+                    center = np.mean([Z[i, int(k)] - U[i, int(k)] for k in neighbors], axis=0)
+                    scale = rho * float(len(neighbors))
+
+                score = center - grad / max(scale, self.cfg.eps)
+                X[i] = self._sinkhorn_project(score)
+
+            # Z-update: pairwise consensus between neighbors.
+            for i in range(n):
+                for k in np.flatnonzero(adj[i]):
+                    k = int(k)
+                    if i < k:
+                        z = 0.5 * (X[i] + U[i, k] + X[k] + U[k, i])
+                        Z[i, k] = z
+                        Z[k, i] = z
+
+            # U-update: scaled dual ascent.
+            primal_residual = 0.0
+            edge_count = 0
+            for i in range(n):
+                for k in np.flatnonzero(adj[i]):
+                    k = int(k)
+                    U[i, k] += X[i] - Z[i, k]
+                    primal_residual += float(np.linalg.norm(X[i] - Z[i, k]))
+                    edge_count += 1
+
+            residual_trace.append(primal_residual / max(edge_count, 1))
+
+            if np.linalg.norm(X - X_prev) < self.cfg.convergence_tol:
+                converged = True
+                break
+
+        return np.mean(X, axis=0).astype(np.float32), residual_trace, converged
+
+    def _sinkhorn_project(self, score: np.ndarray) -> np.ndarray:
+        """Map arbitrary scores to the doubly stochastic relaxation."""
+        temp = max(float(self.cfg.temperature), self.cfg.eps)
+        s = score / temp
+        s = s - np.max(s)
+        mat = np.exp(s).astype(np.float32) + self.cfg.eps
+
+        for _ in range(self.cfg.sinkhorn_iterations):
+            mat /= np.sum(mat, axis=1, keepdims=True) + self.cfg.eps
+            mat /= np.sum(mat, axis=0, keepdims=True) + self.cfg.eps
+
+        return mat.astype(np.float32)
+
+    def _distributed_conflict_resolution(
+        self,
+        relaxed_matrix: np.ndarray,
+        cost_matrix: np.ndarray,
+        adj: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict]:
+        n, m = relaxed_matrix.shape
+        preference_order = np.argsort(-relaxed_matrix, axis=1)
+        rank_ptr = np.zeros(n, dtype=np.int64)
+        assignments = preference_order[:, 0].astype(np.int64)
+
+        num_conflicts = 0
+        rounds_used = 0
+        components = self._connected_components(adj)
+        for r in range(self.cfg.conflict_rounds):
+            rounds_used = r + 1
+            changed = False
+            for component in components:
+                component_set = set(component)
+                for target_j in range(m):
+                    claimers = [
+                        int(i)
+                        for i in component
+                        if int(assignments[int(i)]) == target_j
+                    ]
+                    if len(claimers) <= 1:
+                        continue
+
+                    num_conflicts += 1
+                    # Winner rule is evaluated only inside the communication
+                    # component, avoiding cross-component global knowledge.
+                    winner = min(
+                        claimers,
+                        key=lambda i: (
+                            float(cost_matrix[i, target_j]),
+                            -float(relaxed_matrix[i, target_j]),
+                            int(i),
+                        ),
+                    )
+
+                    for loser in claimers:
+                        if loser == winner:
+                            continue
+                        rank_ptr[loser] += 1
+                        while rank_ptr[loser] < m:
+                            candidate = int(preference_order[loser, rank_ptr[loser]])
+                            component_claimers = [
+                                int(i)
+                                for i in component_set
+                                if int(assignments[int(i)]) == candidate
+                                and int(i) != loser
+                            ]
+                            assignments[loser] = candidate
+                            changed = True
+                            if not component_claimers:
+                                break
+                            break
+
+            if not changed or self._components_are_locally_valid(assignments, components):
+                break
+
+        return assignments.astype(np.int64), {
+            "conflict_rounds_used": int(rounds_used),
+            "num_conflict_events": int(num_conflicts),
+            "num_communication_components": int(len(components)),
+        }
+
+    @staticmethod
+    def _is_valid_assignment(assignments: np.ndarray, num_agents: int) -> bool:
+        if assignments.shape != (num_agents,):
+            return False
+        if np.any(assignments < 0):
+            return False
+        return len(set(assignments.tolist())) == num_agents
+
+    def _global_safety_repair(self, relaxed_matrix: np.ndarray, cost_matrix: np.ndarray) -> np.ndarray:
+        """Deterministic final repair to keep the simulator state valid.
+
+        This is not the conceptual distributed step. It is only used when the
+        communication graph is disconnected or conflict rounds ended before a
+        valid one-to-one assignment was obtained.
+        """
+        n, m = cost_matrix.shape
+        assignments = np.full(n, -1, dtype=np.int64)
+        used_targets: set[int] = set()
+
+        # Agents with a confident relaxed row choose first.
+        confidence = np.max(relaxed_matrix, axis=1)
+        order = np.argsort(-confidence)
+        for i in order:
+            i = int(i)
+            for target_j in np.argsort(-relaxed_matrix[i]):
+                target_j = int(target_j)
+                if target_j not in used_targets:
+                    assignments[i] = target_j
+                    used_targets.add(target_j)
+                    break
+
+        # Any remaining gaps are filled by minimum distance.
+        for i in range(n):
+            if assignments[i] >= 0:
+                continue
+            available = [j for j in range(m) if j not in used_targets]
+            if not available:
+                break
+            best_j = available[int(np.argmin(cost_matrix[i, available]))]
+            assignments[i] = int(best_j)
+            used_targets.add(int(best_j))
+
+        return assignments.astype(np.int64)
 
 def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
     """
@@ -778,6 +1342,14 @@ def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
         return CrossTargetAssigner()
     if name in {"cbba", "consensus_bundle", "auction"}:
         return CBBATargetAssigner(**kwargs)
+    if name in {"cbba_auction", "opportunity_auction", "cbba_opportunity"}:
+        cfg_kwargs = dict(kwargs)
+        cfg_kwargs.setdefault("bid_strategy", "opportunity_auction")
+        cfg_kwargs.setdefault("auction_epsilon", None)
+        cfg_kwargs.setdefault("max_iterations", 500)
+        return CBBATargetAssigner(**cfg_kwargs)
+    if name in {"admm", "distributed_admm", "admm_conflict"}:
+        return DistributedADMMTargetAssigner(**kwargs)
     raise ValueError(f"Unknown assigner name: {name}")
 
 
@@ -794,7 +1366,7 @@ if __name__ == "__main__":
         [8.0, 4.0],
     ], dtype=np.float32)
 
-    for method in ["fixed", "greedy", "hungarian", "cbba"]:
+    for method in ["fixed", "greedy", "hungarian", "cbba", "cbba_auction", "admm"]:
         assigner = build_assigner(method)
         assignments, cost_matrix, info = assigner.assign(agents, targets)
         print(f"\nMethod: {method}")

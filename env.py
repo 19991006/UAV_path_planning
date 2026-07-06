@@ -87,8 +87,9 @@ class UAVEnvConfig:
     # Config value is ignored; kept for backward compatibility.
     racetrack_back_speed: float = 2.0
 
-    # Assignment settings. Options: "hungarian", "greedy", "fixed".
-    assigner_name: str = "hungarian"
+    # Assignment settings. Options: "admm", "hungarian", "greedy", "fixed", "cbba", "cbba_auction".
+    # Default is changed to "admm" for distributed dynamic target assignment.
+    assigner_name: str = "admm"
     reassign_interval: int = 10  # steps between full reassignments (1 = every step)
 
     # LiDAR settings.

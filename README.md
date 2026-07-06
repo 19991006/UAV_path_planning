@@ -48,7 +48,7 @@ and `--torch-num-threads` defaults to 1 to avoid CPU oversubscription on small G
 |----------|---------|-------------|
 | `--num-agents` | 3 | Number of UAVs (targets always equal) |
 | `--num-obstacles` | 20 | Number of circular obstacles |
-| `--assigner-name` | `fixed` | `hungarian`, `greedy`, `fixed`, `cross`, `cbba` |
+| `--assigner-name` | `fixed` | `hungarian`, `greedy`, `fixed`, `cross`, `cbba`, `cbba_auction`, `admm` |
 | `--total-updates` | 1000 | Number of PPO updates |
 | `--rollout-steps` | 512 | Environment steps per rollout |
 | `--seed` | 42 | Random seed |
@@ -58,6 +58,10 @@ and `--torch-num-threads` defaults to 1 to avoid CPU oversubscription on small G
 | `--layout-mode` | `same_side` | Agent/target layout: `same_side` or `cross` |
 
 Run `python train.py --help` for the full list.
+
+Assignment note: `cbba` keeps the original distance-reward bid, while
+`cbba_auction` adds an opportunity-cost / target-price auction bid without
+changing the default CBBA behavior.
 
 **Outputs** (per run, under `runs/<run_name>_N<agents>_O<obstacles>_<assigner>_S<seed>/`):
 

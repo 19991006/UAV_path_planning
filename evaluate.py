@@ -3,7 +3,7 @@ Evaluation and visualization script.
 
 Usage:
     python evaluate.py <run_dir> [--episodes 10] [--no-plots] [--show]
-    python evaluate.py runs/mappo_N3_O20_fixed_S42
+    python evaluate.py runs\20260703_111247_GNN_N5_O20_admm_S42_mappo
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-obstacles", type=int, default=None,
                         help="Override num_obstacles from training config")
     parser.add_argument("--assigner-name", type=str, default=None,
-                        help="Override assigner_name from training config (e.g. 'hungarian', 'greedy', 'fixed', 'cbba')")
+                        help="Override assigner_name from training config (e.g. 'hungarian', 'greedy', 'fixed', 'cbba', 'cbba_auction', 'admm')")
     parser.add_argument("--layout-mode", type=str, default=None,
                         help="Override layout_mode from training config (e.g. 'same_side', 'cross')")
     parser.add_argument("--dynamic-targets", type=bool, default=None,
@@ -423,8 +423,9 @@ def animate_trajectory(
     # matplotlib may not find ffmpeg automatically; check common conda locations.
     if not writers.is_available("ffmpeg"):
         candidates = [
-            Path("D:/anaconda3/envs/deepRL/Library/bin/ffmpeg.exe"),
+            Path("D:/ffmepg/ffmpeg-2026-04-19-git-de18feb0f0-essentials_build/bin/ffmpeg.exe"),
             Path("D:/anaconda3/Library/bin/ffmpeg.exe"),
+
         ]
         for p in candidates:
             if p.exists():
