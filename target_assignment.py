@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 
@@ -32,27 +32,6 @@ AssignmentResult = Tuple[np.ndarray, np.ndarray, Dict]
 
 
 @dataclass
-class CBBAConfig:
-    """Configuration for CBBATargetAssigner.
-
-    Args:
-        L_t: Maximum number of tasks each agent can hold (default 1 = single-assignment).
-        max_iterations: Maximum Phase-1/Phase-2 alternations before forced return.
-        use_timestamps: If True, use full Table I with timestamp-based freshness checks.
-        communication_graph: (N_u, N_u) adjacency matrix. None means fully connected.
-        squared_distance: Use squared Euclidean distance for score computation.
-        max_dist_sq: Maximum squared distance between any agent-target pair.
-            Used to convert distances to non-negative rewards. If None, computed
-            automatically from agent/target positions at assign() time.
-    """
-    L_t: int = 1
-    max_iterations: int = 50
-    use_timestamps: bool = False
-    communication_graph: Optional[np.ndarray] = None
-    squared_distance: bool = True
-    max_dist_sq: Optional[float] = None
-
-
 class BaseTargetAssigner(ABC):
     """
     Abstract base class for online target assignment.
@@ -276,297 +255,41 @@ class CrossTargetAssigner(BaseTargetAssigner):
         return assignments, cost_matrix, info
 
 
-class CBBAAgent:
-    """Single agent in the CBBA auction.
+class CBAATargetAssigner(BaseTargetAssigner):
+    """Consensus-Based Auction Algorithm (Choi, Brunet & How 2009, Section III).
 
-    Holds the five local state vectors per Choi et al. (2009):
-        b: bundle (ordered by time of addition)
-        p: path (ordered by execution sequence)
-        y: winning bid list (length N_t)
-        z: winning agent list (length N_t, -1 = none)
-        s: timestamp list (length N_u)
+    Single-task assignment: each agent is assigned exactly one target.
+    Iterates between two phases until a conflict-free assignment is reached.
+
+    Phase 1 - Auction (Algorithm 1):
+        Each *unassigned* agent picks the task with the highest bid that
+        exceeds the current winning bid known to that agent:
+            h_ij = I(c_ij > y_ij)          # Eq (2): valid tasks
+            J_i  = argmax_j  h_ij * c_ij    # best valid task
+        Then sets x_i,J_i = 1 and y_i,J_i = c_i,J_i.
+
+    Phase 2 - Consensus (Algorithm 2):
+        (a) Max-consensus: every agent replaces its y vector with the
+            element-wise maximum over its neighbours.
+        (b) Winner check: for each assigned agent, if a neighbour has a
+            strictly higher bid on the agent's task (or an equal bid from
+            a lower-ID agent), the agent releases the task.
+
+    State per agent i:
+        x[i]  - binary vector [N_t];  x[i][j] = 1  iff agent i holds task j
+        y[i]  - float vector  [N_t];  y[i][j] = highest bid agent i knows for task j
+
+    Convergence: Theorem 1 guarantees a conflict-free assignment in at most
+    N_min * D iterations on a connected static graph with DMG scoring.
     """
 
-    def __init__(
-        self,
-        agent_id: int,
-        position: np.ndarray,
-        target_positions: np.ndarray,
-        config: CBBAConfig,
-        max_dist_sq: Optional[float] = None,
-    ):
-        self.agent_id = agent_id
-        self.position = position.astype(np.float32)
-        self.targets = target_positions.astype(np.float32)
-        self.cfg = config
-        self.max_dist_sq = max_dist_sq
+    def __init__(self, max_iterations: int = 100, squared_distance: bool = True):
+        self.max_iterations = max_iterations
+        self.squared_distance = squared_distance
 
-        self.num_targets = target_positions.shape[0]
-        self.num_agents_for_s = 0  # set externally after initialization
-
-        self.b: list[int] = []
-        self.p: list[int] = []
-        self.y = np.zeros(self.num_targets, dtype=np.float32)
-        self.z = np.full(self.num_targets, -1, dtype=np.int64)
-        self.s = np.zeros(1, dtype=np.float32)
-
-        self.total_score = 0.0
-
-    @staticmethod
-    def _distance_sq(a: np.ndarray, b: np.ndarray) -> float:
-        """Squared Euclidean distance between two points."""
-        return float(np.sum((a - b) ** 2))
-
-    def _path_score(self, path: list[int]) -> float:
-        """S_i^{p_i}: total reward along a path = sum (max_dist_sq - dist_sq).
-
-        Converts distances to non-negative rewards so that CBBA marginal gains
-        (Equation 3) are always >= 0 as required by c_ij >= 0 in the paper.
-        """
-        if not path:
-            return 0.0
-        score = 0.0
-        prev = self.position
-        for task_id in path:
-            target = self.targets[task_id]
-            dist_sq = self._distance_sq(prev, target)
-            if self.cfg.squared_distance:
-                score += self.max_dist_sq - dist_sq
-            else:
-                score += self.max_dist_sq - float(np.sqrt(dist_sq + 1e-8))
-            prev = target
-        return score
-
-    def _marginal_gain(self, task_j: int) -> Tuple[float, int]:
-        """Equation (3): max score improvement from inserting task_j into current path.
-
-        Returns:
-            (gain, best_insert_position): gain = max_n (S^{p ⊕_n {j}} - S^p),
-            best_insert_position is the n that achieves the max.
-        """
-        current_score = self.total_score
-        best_score = -float('inf')
-        best_pos = 0
-
-        for n in range(len(self.p) + 1):
-            candidate = list(self.p)
-            candidate.insert(n, task_j)
-            score = self._path_score(candidate)
-            if score > best_score:
-                best_score = score
-                best_pos = n
-
-        gain = best_score - current_score
-        return gain, best_pos
-
-    def build_bundle(self) -> bool:
-        """Phase 1: Bundle construction (Algorithm 3 in the paper).
-
-        Greedily adds tasks to the bundle until no more profitable tasks exist
-        or the bundle reaches L_t capacity.
-
-        Returns:
-            True if the bundle changed, False otherwise.
-        """
-        changed = False
-
-        while len(self.b) < self.cfg.L_t:
-            best_gain = -float('inf')
-            best_task = -1
-            best_pos = -1
-
-            for j in range(self.num_targets):
-                if j in self.b:
-                    continue
-                gain, insert_pos = self._marginal_gain(j)
-
-                # Equation (2): h_ij = I(c_ij > y_ij)
-                if gain <= 0.0 or gain <= self.y[j]:
-                    continue
-
-                if gain > best_gain:
-                    best_gain = gain
-                    best_task = j
-                    best_pos = insert_pos
-
-            if best_task == -1:
-                break
-
-            # Equation (4): update bundle, path, y, z
-            self.b.append(best_task)
-            self.p.insert(best_pos, best_task)
-            self.y[best_task] = best_gain
-            self.z[best_task] = self.agent_id
-            self.total_score += best_gain
-            changed = True
-
-        return changed
-
-    def receive_from(self, sender: "CBBAAgent") -> None:
-        """Phase 2: Process a message from a neighboring agent (Table I)."""
-        for j in range(self.num_targets):
-            z_s = sender.z[j]
-            z_r = self.z[j]
-            y_s = sender.y[j]
-            y_r = self.y[j]
-
-            action = self._resolve_action(z_s, z_r, y_s, y_r, sender)
-            self._apply_action(j, action, y_s, z_s)
-
-    def _resolve_action(
-        self, z_s: int, z_r: int, y_s: float, y_r: float, sender: "CBBAAgent"
-    ) -> str:
-        """Determine update/reset/leave per Table I."""
-        sid = sender.agent_id
-        rid = self.agent_id
-
-        # Case: sender thinks it is the winner
-        if z_s == sid:
-            if z_r == rid:
-                return "update" if y_s > y_r else "leave"
-            if z_r == sid:
-                return "update"
-            if z_r == -1:
-                return "update"
-            # z_r is third party m
-            if self.cfg.use_timestamps:
-                if sender.s[z_r] > self.s[z_r] or y_s > y_r:
-                    return "update"
-                return "leave"
-            return "update"
-
-        # Case: sender thinks receiver is the winner
-        if z_s == rid:
-            if z_r == rid:
-                return "leave"
-            if z_r == sid:
-                return "reset"
-            if z_r == -1:
-                return "leave"
-            # z_r is third party m
-            if self.cfg.use_timestamps:
-                if sender.s[z_r] > self.s[z_r]:
-                    return "reset"
-                return "leave"
-            return "leave"
-
-        # Case: sender thinks a third party m is the winner
-        if z_s != -1 and z_s != sid and z_s != rid:
-            if z_r == rid:
-                if self.cfg.use_timestamps:
-                    if sender.s[z_s] > self.s[z_s] and y_s > y_r:
-                        return "update"
-                    return "leave"
-                return "update" if y_s > y_r else "leave"
-            if z_r == sid:
-                if self.cfg.use_timestamps:
-                    if sender.s[z_s] > self.s[z_s]:
-                        return "update"
-                    return "reset"
-                return "reset"
-            if z_r == z_s:
-                if self.cfg.use_timestamps:
-                    if sender.s[z_s] > self.s[z_s]:
-                        return "update"
-                    return "leave"
-                return "update" if y_s > y_r else "leave"
-            if z_r == -1:
-                if self.cfg.use_timestamps:
-                    if sender.s[z_s] > self.s[z_s]:
-                        return "update"
-                    return "leave"
-                return "update"
-            # z_r is different third party n
-            if self.cfg.use_timestamps:
-                if sender.s[z_s] > self.s[z_s] and sender.s[z_r] > self.s[z_r]:
-                    return "update"
-                if sender.s[z_s] > self.s[z_s] and y_s > y_r:
-                    return "update"
-                if sender.s[z_r] > self.s[z_r] and self.s[z_s] > sender.s[z_s]:
-                    return "reset"
-                return "leave"
-            return "update" if y_s > y_r else "leave"
-
-        # Case: sender thinks no one has won the task
-        if z_s == -1:
-            if z_r == rid:
-                return "leave"
-            if z_r == sid:
-                return "update"
-            if z_r == -1:
-                return "leave"
-            # z_r is third party m
-            if self.cfg.use_timestamps:
-                if sender.s[z_r] > self.s[z_r]:
-                    return "update"
-                return "leave"
-            return "leave"
-
-        return "leave"
-
-    def _apply_action(self, j: int, action: str, y_s: float, z_s: int) -> None:
-        if action == "update":
-            self.y[j] = y_s
-            self.z[j] = z_s
-        elif action == "reset":
-            self.y[j] = 0.0
-            self.z[j] = -1
-
-    def update_timestamp(self, sender_id: int, time: float) -> None:
-        """Record that we received fresh info from sender_id at the given time."""
-        if sender_id < len(self.s):
-            self.s[sender_id] = max(self.s[sender_id], time)
-
-    def cascade_release(self) -> bool:
-        """Equation (6): Release outbid tasks and all tasks added after them.
-
-        Finds the first task in the bundle where z[task] != agent_id.
-        Releases that task and all subsequent bundle entries.
-        Rebuilds path from the remaining bundle entries.
-
-        Returns:
-            True if any tasks were released.
-        """
-        # Find first outbid position
-        n_bar = len(self.b)
-        for n, task in enumerate(self.b):
-            if self.z[task] != self.agent_id:
-                n_bar = n
-                break
-
-        if n_bar == len(self.b):
-            return False
-
-        # Release tasks from n_bar onward
-        for n in range(n_bar, len(self.b)):
-            task = self.b[n]
-            self.y[task] = 0.0
-            self.z[task] = -1
-
-        # Truncate bundle
-        self.b = self.b[:n_bar]
-
-        # Rebuild path: keep only tasks still in bundle
-        self.p = [t for t in self.p if t in self.b]
-
-        # Recompute total score
-        self.total_score = self._path_score(self.p)
-        return True
-
-
-class CBBATargetAssigner(BaseTargetAssigner):
-    """Consensus-Based Bundle Algorithm (CBBA) for distributed task assignment.
-
-    Implements the algorithm from Choi, Brunet & How (2009). Internally creates
-    one CBBAAgent per UAV and alternates between Phase 1 (bundle construction)
-    and Phase 2 (consensus-based conflict resolution) until convergence.
-
-    Args:
-        config: CBBAConfig with algorithm parameters.
-    """
-
-    def __init__(self, config: Optional[CBBAConfig] = None, **kwargs):
-        self.cfg = config or CBBAConfig(**kwargs)
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def assign(
         self,
@@ -579,183 +302,282 @@ class CBBATargetAssigner(BaseTargetAssigner):
         num_agents = agent_positions.shape[0]
         num_targets = target_positions.shape[0]
 
-        # Compute max_dist_sq for reward normalization if not provided
-        max_dist_sq = self.cfg.max_dist_sq
-        if max_dist_sq is None:
-            diff = agent_positions[:, None, :] - target_positions[None, :, :]
-            max_dist_sq = float(np.max(np.sum(diff ** 2, axis=-1)))
+        # -- bid matrix  c[i][j] >= 0 ---------------------------------
+        diff = agent_positions[:, None, :] - target_positions[None, :, :]
+        dist_sq = np.sum(diff ** 2, axis=-1)
+        max_dist_sq = float(np.max(dist_sq))
+        if self.squared_distance:
+            bid = (max_dist_sq - dist_sq).astype(np.float32)
+        else:
+            bid = (max_dist_sq - np.sqrt(dist_sq + 1e-8)).astype(np.float32)
 
-        # 1. Initialize agents
-        agents = [
-            CBBAAgent(i, agent_positions[i], target_positions, self.cfg, max_dist_sq)
-            for i in range(num_agents)
-        ]
-
-        # Set timestamp vector sizes
-        for agent in agents:
-            agent.num_agents_for_s = num_agents
-            agent.s = np.zeros(num_agents, dtype=np.float32)
-
-        # Build communication graph: config > kwargs > fully-connected default
-        if self.cfg.communication_graph is not None:
-            adj = np.asarray(self.cfg.communication_graph)
-        elif "communication_graph" in kwargs and kwargs["communication_graph"] is not None:
-            adj = np.asarray(kwargs["communication_graph"])
+        # -- communication graph --------------------------------------
+        if ("communication_graph" in kwargs
+                and kwargs["communication_graph"] is not None):
+            adj = np.asarray(kwargs["communication_graph"], dtype=bool)
         else:
             adj = np.ones((num_agents, num_agents), dtype=bool)
             np.fill_diagonal(adj, False)
 
-        # 2. Iterate Phase 1 <-> Phase 2 until convergence
-        iteration = 0
-        for iteration in range(self.cfg.max_iterations):
-            # Phase 1: Bundle construction
-            for agent in agents:
-                agent.build_bundle()
+        # -- initialise state -----------------------------------------
+        x = np.zeros((num_agents, num_targets), dtype=bool)     # x[i]
+        y = np.zeros((num_agents, num_targets), dtype=np.float32)  # y[i]
 
-            if self.cfg.L_t == 1 and not self.cfg.use_timestamps:
-                # CBAA Phase 2 — Algorithm 2 from Choi et al. (2009).
+        # -- Phase 1 / Phase 2 iteration ------------------------------
+        for iteration in range(self.max_iterations):
+
+            # ==========================================================
+            # Phase 1 - Auction (Algorithm 1)
+            # ==========================================================
+            # Only *unassigned* agents place bids.
+            for i in range(num_agents):
+                if np.any(x[i]):            # sum_j x_ij != 0  ->  skip
+                    continue
+
+                # h_ij = I(c_ij > y_ij)                               Eq (2)
+                h = bid[i] > y[i]
+                if not np.any(h):
+                    continue                # no task with bid > known max
+
+                # J_i = argmax_j  h_ij * c_ij
+                masked = np.where(h, bid[i], -np.inf)
+                J_i = int(np.argmax(masked))
+
+                # place bid
+                x[i, J_i] = True
+                y[i, J_i] = bid[i, J_i]
+
+            # ==========================================================
+            # Phase 2 - Consensus (Algorithm 2)
+            # ==========================================================
+
+            # Snapshot pre-consensus state so that max-consensus and
+            # winner check use the same synchronised values.
+            y_snap = y.copy()
+            x_snap = x.copy()
+
+            # --- Line 4: max-consensus ---------------------------------
+            for i in range(num_agents):
+                nb = np.where(adj[i])[0]
+                if len(nb) > 0:
+                    y[i] = np.maximum(y_snap[i], y_snap[nb].max(axis=0))
+                else:
+                    y[i] = y_snap[i].copy()
+
+            # --- Lines 5-8: winner check -------------------------------
+            for i in range(num_agents):
+                if not np.any(x[i]):        # unassigned -> skip
+                    continue
+
+                J_i = int(np.argmax(x[i]))  # task held by agent i
+
+                # z_i,J_i = argmax_{k : g_ik=1 or k==i}  y_snap[k][J_i]
                 #
-                # Line 3-4: y_ij = max_{k: adj[i,k] or k==i} y_kj   ∀j
-                # Line 5-8: z_i,J_i = argmax_k (y_k,J_i); release if z_i ≠ i.
-                #
-                # Snapshot all y vectors first so that the winner check uses
-                # Phase-1 values, not values already updated by max-consensus.
-
-                # --- Snapshot ---
-                y_snapshot = [a.y.copy() for a in agents]
-                prev_bundles = [list(a.b) for a in agents]
-
-                # --- Max-consensus (Line 3-4) ---
-                for i in range(num_agents):
-                    best = y_snapshot[i].copy()
-                    for k in range(num_agents):
-                        if adj[i, k]:
-                            best = np.maximum(best, y_snapshot[k])
-                    agents[i].y = best
-
-                # --- Winner check (Lines 5-8) using snapshot ---
-                for i in range(num_agents):
-                    if not agents[i].b:
+                # Two rules:
+                # 1. Strictly higher bid → always wins (lets max-consensus
+                #    propagated values resolve non-neighbour conflicts).
+                # 2. Equal bid → prefer the agent that actually *holds*
+                #    the task.  Between two holders, lower ID wins.
+                best_agent = i
+                best_bid = y_snap[i, J_i]
+                for k in range(num_agents):
+                    if k == i or not adj[i, k]:
                         continue
-                    task_j = agents[i].b[0]
-
-                    best_agent = i
-                    best_bid = y_snapshot[i][task_j]
-                    for k in range(num_agents):
-                        if not adj[i, k]:
-                            continue
-                        if y_snapshot[k][task_j] > best_bid:
-                            best_bid = y_snapshot[k][task_j]
+                    val = y_snap[k, J_i]
+                    if val > best_bid:
+                        best_bid = val
+                        best_agent = k
+                    elif val == best_bid:
+                        k_holds = x_snap[k, J_i]
+                        best_holds = x_snap[best_agent, J_i]
+                        if k_holds and not best_holds:
+                            best_agent = k
+                        elif k_holds == best_holds and k < best_agent:
                             best_agent = k
 
-                    if best_agent != i:
-                        agents[i].y[task_j] = 0.0
-                        agents[i].z[task_j] = -1
-                        agents[i].b = []
-                        agents[i].p = []
-                        agents[i].total_score = 0.0
+                if best_agent != i:
+                    # outbid - release task.
+                    # y is NOT cleared: max-consensus has already set y[i][J_i]
+                    # to the global winning bid, which correctly prevents
+                    # this agent from re-bidding on the same task next round.
+                    x[i, :] = False
 
-                # Convergence or early exit.
-                if self._is_converged_cbaa(agents, num_agents):
-                    break
-                # Early exit after a stationary iteration: no agent released
-                # and no new bids placed — the assignment is stable.  The
-                # greedy fallback at the output stage handles remaining gaps.
-                bundles_unchanged = all(
-                    list(a.b) == prev_bundles[idx] for idx, a in enumerate(agents)
-                )
-                if bundles_unchanged:
-                    break
-            else:
-                # CBBA Phase 2 — Table I pairwise consensus.
-                for i in range(num_agents):
-                    for k in range(num_agents):
-                        if i == k or not adj[i, k]:
-                            continue
-                        agents[i].receive_from(agents[k])
-                        if self.cfg.use_timestamps:
-                            agents[i].update_timestamp(k, float(iteration))
+            # ==========================================================
+            # Convergence check
+            # ==========================================================
+            assigned = np.any(x, axis=1)
+            if not np.all(assigned):
+                continue
 
-                # Cascading release
-                for agent in agents:
-                    agent.cascade_release()
+            # No task may be assigned to more than one agent.
+            if np.any(np.sum(x, axis=0) > 1):
+                continue
 
-                # Check convergence
-                if self._is_converged(agents, num_agents):
-                    break
+            break   # converged
 
-        # 3. Build cost matrix
-        diff = agent_positions[:, None, :] - target_positions[None, :, :]
-        cost_matrix = np.sum(diff ** 2, axis=-1).astype(np.float32)
-
-        # 4. Build output assignments
+        # -- build output assignments ---------------------------------
         assignments = np.full(num_agents, -1, dtype=np.int64)
-        for i, agent in enumerate(agents):
-            if agent.b:
-                assignments[i] = agent.b[0]
-
-        # Resolve remaining conflicts / unassigned agents greedily.
-        assigned_mask = assignments >= 0
-        _, counts = np.unique(assignments[assigned_mask], return_counts=True)
-        if np.any(counts > 1) or np.any(~assigned_mask):
-            claimed = set()
-            clean = np.full(num_agents, -1, dtype=np.int64)
-            order = np.argsort(cost_matrix.min(axis=1))
-            for i in order:
-                available = [j for j in range(num_targets) if j not in claimed]
-                if not available:
-                    break
-                best_j = available[int(np.argmin(cost_matrix[i, available]))]
-                clean[i] = best_j
-                claimed.add(best_j)
-            assignments = clean
+        for i in range(num_agents):
+            if np.any(x[i]):
+                assignments[i] = int(np.argmax(x[i]))
 
         if np.any(assignments < 0):
+            unassigned = [i for i in range(num_agents) if assignments[i] < 0]
             raise RuntimeError(
-                f"CBBA/CBAA failed to assign all agents. "
-                f"Assigned: {assignments.tolist()}, "
-                f"converged at iteration {iteration + 1}."
+                f"CBAA did not converge within {self.max_iterations} iterations. "
+                f"Unassigned agents: {unassigned}. "
+                f"Increase max_iterations or check graph connectivity."
             )
 
-        total_cost = float(sum(cost_matrix[i, assignments[i]] for i in range(num_agents)))
+        if np.any(np.bincount(assignments[assignments >= 0]) > 1):
+            raise RuntimeError(
+                "CBAA converged with task conflicts - this should not happen."
+            )
+
+        # -- diagnostics ----------------------------------------------
+        cost_matrix = dist_sq.astype(np.float32)
+        total_cost = float(sum(cost_matrix[i, assignments[i]]
+                               for i in range(num_agents)))
         info = {
-            "assigner": "cbba",
+            "assigner": "cbaa",
             "total_assignment_cost": total_cost,
             "iterations": iteration + 1,
-            "converged": self._is_converged_cbaa(agents, num_agents),
+            "converged": True,
         }
         return assignments, cost_matrix, info
 
-    @staticmethod
-    def _is_converged(agents: list[CBBAAgent], num_agents: int) -> bool:
-        """Check convergence (CBBA): all z vectors agree and all agents assigned."""
-        if not agents:
-            return False
-        for j in range(agents[0].num_targets):
-            winner = agents[0].z[j]
-            for agent in agents[1:]:
-                if agent.z[j] != winner:
-                    return False
 
-        assigned_count = sum(1 for a in agents if len(a.b) > 0)
-        return assigned_count >= num_agents
+class EGTAPTargetAssigner(BaseTargetAssigner):
+    """Extra-Gradient Task Assignment (EG-TAP) via saddle-point dynamics.
 
-    @staticmethod
-    def _is_converged_cbaa(agents: list[CBBAAgent], num_agents: int) -> bool:
-        """Check convergence (CBAA): all agents assigned and no task conflicts."""
-        if not agents:
-            return False
-        # Every agent must hold exactly one task (L_t = 1).
-        if any(len(a.b) != 1 for a in agents):
-            return False
-        # No two agents may claim the same task.
-        claimed = set()
-        for a in agents:
-            task_j = a.b[0]
-            if task_j in claimed:
-                return False
-            claimed.add(task_j)
-        return True
+    Algorithm 2 from Huang, Kuai, Cui, Meng & Sun (2024).
+    Distributed optimisation — each agent i maintains states
+    (x_i, y_i, mu_i, lambda_i) and exchanges y_i, mu_i with neighbours.
+
+    Computes a conflict-free one-to-one assignment with O(1/k) convergence.
+    Computational complexity: O(2m) per iteration, independent of N.
+
+    A small random perturbation (Algorithm 3) is applied to the cost vectors
+    to break symmetry and prevent the inconsistency phenomenon where the
+    relaxed problem admits non-integer optimal solutions.
+    """
+
+    def __init__(self, step_size: float = 0.1, max_iterations: int = 5000,
+                 squared_distance: bool = True, perturbation_scale: float = 1e-6,
+                 check_interval: int = 50, seed: int | None = None):
+        self.alpha = step_size
+        self.max_iterations = max_iterations
+        self.squared_distance = squared_distance
+        self.perturbation_scale = perturbation_scale
+        self.check_interval = check_interval
+        self._rng = np.random.default_rng(seed)
+
+    def assign(
+        self,
+        agent_positions: np.ndarray,
+        target_positions: np.ndarray,
+        **kwargs,
+    ) -> AssignmentResult:
+        HungarianTargetAssigner._validate_inputs(agent_positions, target_positions)
+
+        n = agent_positions.shape[0]   # N agents
+        m = target_positions.shape[0]  # m tasks
+
+        # -- cost vectors  c[i][j] = dist^2, normalized to [0,1] ------
+        diff = agent_positions[:, None, :] - target_positions[None, :, :]
+        dist_sq = np.sum(diff ** 2, axis=-1)
+        if self.squared_distance:
+            raw_c = dist_sq.astype(np.float32)
+        else:
+            raw_c = np.sqrt(dist_sq + 1e-8).astype(np.float32)
+        c_max = float(np.max(raw_c))
+
+        # Algorithm 3: add small random perturbation to original cost
+        # vectors c_{i,l} to break symmetry and avoid the inconsistency
+        # phenomenon (Huang et al. 2024, Theorem 2).
+        # Per paper, σ̄ is "arbitrarily small"; we scale it by c_max so
+        # the perturbation remains meaningful in float32 for all N.
+        if self.perturbation_scale > 0 and c_max > 0:
+            pert_mag = self.perturbation_scale * c_max
+            raw_c = raw_c + self._rng.uniform(
+                -pert_mag, pert_mag, size=raw_c.shape,
+            ).astype(np.float32)
+            c_max = float(np.max(raw_c))
+
+        c = (raw_c / c_max).astype(np.float32) if c_max > 0 else raw_c
+
+        # -- communication graph & Laplacian --------------------------
+        comm = kwargs.get("communication_graph", None)
+        if comm is not None:
+            adj = np.asarray(comm, dtype=np.float32)
+        else:
+            adj = np.ones((n, n), dtype=np.float32)
+            np.fill_diagonal(adj, 0.0)
+
+        degree = adj.sum(axis=1)
+        L = np.diag(degree) - adj          # Laplacian: N×N
+        L = L.astype(np.float32)
+
+        # -- initialise states ----------------------------------------
+        x = np.zeros((n, m), dtype=np.float32)
+        y = np.zeros((n, m), dtype=np.float32)
+        mu = np.zeros((n, m), dtype=np.float32)
+        lam = np.zeros((n, 1), dtype=np.float32)
+
+        alpha = self.alpha
+        ones_over_N = np.ones((1, m), dtype=np.float32) / float(n)
+
+        iterations_run = 0
+        for k in range(self.max_iterations):
+            # ---- Step 1: midpoint (Eq 9) ----------------------------
+            x_mid = np.clip(x - alpha * (c - mu + lam), 0.0, 1.0)        # 9a
+            y_mid = y + alpha * (L @ mu)                                  # 9b
+            mu_mid = np.maximum(
+                0.0,
+                mu + alpha * (ones_over_N - x - (L @ (y + mu))),          # 9c
+            )
+            lam_mid = lam + alpha * (x.sum(axis=1, keepdims=True) - 1.0)  # 9d
+
+            # ---- Step 2: next iterate (Eq 10) -----------------------
+            x_next = np.clip(x - alpha * (c - mu_mid + lam_mid), 0.0, 1.0)  # 10a
+            y_next = y + alpha * (L @ mu_mid)                                 # 10b
+            mu_next = np.maximum(
+                0.0,
+                mu + alpha * (ones_over_N - x_mid - (L @ (y_mid + mu_mid))),  # 10c
+            )
+            lam_next = lam + alpha * (x_mid.sum(axis=1, keepdims=True) - 1.0)  # 10d
+
+            x, y, mu, lam = x_next, y_next, mu_next, lam_next
+
+            # ---- early convergence check -----------------------------
+            if (k + 1) % self.check_interval == 0:
+                trial = np.argmax(x, axis=1)
+                if len(set(trial)) == n:
+                    iterations_run = k + 1
+                    break
+        else:
+            iterations_run = self.max_iterations
+
+        # -- discretise: argmax per agent -----------------------------
+        assignments = np.argmax(x, axis=1).astype(np.int64)
+
+        if len(set(assignments)) < n:
+            raise RuntimeError(
+                f"EG-TAP did not converge to a conflict-free assignment "
+                f"within {self.max_iterations} iterations "
+                f"(N={n}, α={self.alpha}). "
+                f"Try increasing max_iterations or adjusting step_size."
+            )
+
+        # -- diagnostics ----------------------------------------------
+        cost_matrix = dist_sq.astype(np.float32)
+        total_cost = float(sum(cost_matrix[i, assignments[i]] for i in range(n)))
+        info = {
+            "assigner": "eg-tap",
+            "total_assignment_cost": total_cost,
+            "iterations": iterations_run,
+        }
+        return assignments, cost_matrix, info
 
 
 def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
@@ -765,7 +587,7 @@ def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
     Example:
         assigner = build_assigner("hungarian")
         assigner = build_assigner("greedy")
-        assigner = build_assigner("fixed")
+        assigner = build_assigner("cbaa")
     """
     name = name.lower()
     if name in {"hungarian", "hungarian_target", "min_cost"}:
@@ -776,8 +598,10 @@ def build_assigner(name: str, **kwargs) -> BaseTargetAssigner:
         return FixedTargetAssigner()
     if name in {"cross", "reverse"}:
         return CrossTargetAssigner()
-    if name in {"cbba", "consensus_bundle", "auction"}:
-        return CBBATargetAssigner(**kwargs)
+    if name in {"cbaa", "cbba", "consensus_bundle", "auction"}:
+        return CBAATargetAssigner(**kwargs)
+    if name in {"egtap", "eg-tap"}:
+        return EGTAPTargetAssigner(**kwargs)
     raise ValueError(f"Unknown assigner name: {name}")
 
 
@@ -794,7 +618,7 @@ if __name__ == "__main__":
         [8.0, 4.0],
     ], dtype=np.float32)
 
-    for method in ["fixed", "greedy", "hungarian", "cbba"]:
+    for method in ["fixed", "greedy", "hungarian", "cbaa", "egtap"]:
         assigner = build_assigner(method)
         assignments, cost_matrix, info = assigner.assign(agents, targets)
         print(f"\nMethod: {method}")
