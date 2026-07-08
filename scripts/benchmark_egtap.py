@@ -8,11 +8,16 @@ Tests native convergence (no fallback) across N and α.
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 from typing import Optional, Tuple
+
+# Ensure project root is on sys.path for `rl_path_planning` imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from target_assignment import EGTAPTargetAssigner, HungarianTargetAssigner
+from rl_path_planning.target_assignment import EGTAPTargetAssigner, HungarianTargetAssigner
 
 
 # ---------------------------------------------------------------------------

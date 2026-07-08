@@ -34,8 +34,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from actor_critic import ActorCritic, NetworkConfig
-from rollout_buffer import BufferConfig, RolloutBuffer
+from rl_path_planning.actor_critic import ActorCritic, NetworkConfig
+from rl_path_planning.rollout_buffer import BufferConfig, RolloutBuffer
 
 
 @dataclass

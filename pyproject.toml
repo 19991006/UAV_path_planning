@@ -10,4 +10,9 @@ dependencies = [
     "numpy>=1.26",
     "torch>=2.0",
     "tensorboard>=2.0",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["rl_path_planning"]

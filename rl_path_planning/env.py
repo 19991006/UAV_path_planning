@@ -23,14 +23,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-try:
-    from target_assignment import BaseTargetAssigner, build_assigner
-except ImportError as exc:
-    raise ImportError(
-        "Could not import target_assignment. "
-        "Please save the pluggable assignment module as target_assignment.py "
-        "or update the import path to assignment.target_assignment."
-    ) from exc
+from rl_path_planning.target_assignment import BaseTargetAssigner, build_assigner
 
 
 @dataclass

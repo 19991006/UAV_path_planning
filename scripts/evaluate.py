@@ -10,15 +10,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+# Ensure project root is on sys.path for `rl_path_planning` imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 
-from env import MultiUAV2DEnv, UAVEnvConfig
-from mappo import MAPPOAgent, MAPPOConfig
-from gnn_mappo import GraphMAPPOAgent
+from rl_path_planning.env import MultiUAV2DEnv, UAVEnvConfig
+from rl_path_planning.mappo import MAPPOAgent, MAPPOConfig
+from rl_path_planning.gnn_mappo import GraphMAPPOAgent
 
 
 def parse_args() -> argparse.Namespace:

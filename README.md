@@ -15,28 +15,28 @@ pip install numpy torch scipy matplotlib tensorboard
 
 ```bash
 # Quick test run
-python train.py --total-updates 20 --rollout-steps 128 --num-obstacles 5
+python scripts/train.py --total-updates 20 --rollout-steps 128 --num-obstacles 5
 
 # Full training
-python train.py --total-updates 1000 --rollout-steps 512 --num-obstacles 20
+python scripts/train.py --total-updates 1000 --rollout-steps 512 --num-obstacles 20
 
 # With cross-path assignment (agents cross each other)
-python train.py --num-agents 5 --num-obstacles 20 --assigner-name cross --run-name cross5
+python scripts/train.py --num-agents 5 --num-obstacles 20 --assigner-name cross --run-name cross5
 
 # Resume from checkpoint
-python train.py --resume-checkpoint runs/<tag>/checkpoints/final.pt
+python scripts/train.py --resume-checkpoint runs/<tag>/checkpoints/final.pt
 ```
 
 ### GNN MAPPO
 
 ```bash
 # Smoke test
-python train.py --use-gnn --total-updates 1 --rollout-steps 8 --ppo-epochs 1 \
+python scripts/train.py --use-gnn --total-updates 1 --rollout-steps 8 --ppo-epochs 1 \
   --minibatch-size 4 --num-agents 3 --num-obstacles 0 --max-steps 20 \
   --eval-interval 0 --save-interval 0
 
 # Full GNN training
-python train.py --use-gnn --num-agents 5 --num-obstacles 5 --total-updates 1000
+python scripts/train.py --use-gnn --num-agents 5 --num-obstacles 5 --total-updates 1000
 ```
 
 When `--use-gnn` is set, `--minibatch-size` means graph time steps (not flattened agent samples),
@@ -48,7 +48,7 @@ and `--torch-num-threads` defaults to 1 to avoid CPU oversubscription on small G
 |----------|---------|-------------|
 | `--num-agents` | 3 | Number of UAVs (targets always equal) |
 | `--num-obstacles` | 20 | Number of circular obstacles |
-| `--assigner-name` | `fixed` | `hungarian`, `greedy`, `fixed`, `cross`, `cbba` |
+| `--assigner-name` | `fixed` | `hungarian`, `greedy`, `fixed`, `cross`, `cbba`, `egtap` |
 | `--total-updates` | 1000 | Number of PPO updates |
 | `--rollout-steps` | 512 | Environment steps per rollout |
 | `--seed` | 42 | Random seed |
@@ -57,7 +57,7 @@ and `--torch-num-threads` defaults to 1 to avoid CPU oversubscription on small G
 | `--use-gnn` | off | Use GNN MAPPO agent (agent-count generalizable) |
 | `--layout-mode` | `same_side` | Agent/target layout: `same_side` or `cross` |
 
-Run `python train.py --help` for the full list.
+Run `python scripts/train.py --help` for the full list.
 
 **Outputs** (per run, under `runs/<run_name>_N<agents>_O<obstacles>_<assigner>_S<seed>/`):
 
@@ -78,13 +78,13 @@ tensorboard --logdir runs/<tag>/tensorboard
 
 ```bash
 # Evaluate with default settings
-python evaluate.py runs/mappo_N3_O20_fixed_S42
+python scripts/evaluate.py runs/mappo_N3_O20_fixed_S42
 
 # More episodes, show plots interactively
-python evaluate.py runs/mappo_N5_O20_cross_S42 --episodes 20 --show
+python scripts/evaluate.py runs/mappo_N5_O20_cross_S42 --episodes 20 --show
 
 # Stochastic policy, no plot output
-python evaluate.py runs/mappo_N3_O20_fixed_S42 --stochastic --no-plots
+python scripts/evaluate.py runs/mappo_N3_O20_fixed_S42 --stochastic --no-plots
 ```
 
 ### Cross-N evaluation (GNN)
@@ -92,19 +92,25 @@ python evaluate.py runs/mappo_N3_O20_fixed_S42 --stochastic --no-plots
 GNN checkpoints are agent-count independent — train at one N, evaluate at another:
 
 ```bash
-python evaluate.py runs/<your_run_dir> --checkpoint best.pt --eval-num-agents 10 --episodes 10
+python scripts/evaluate.py runs/<your_run_dir> --checkpoint best.pt --eval-num-agents 10 --episodes 10
 ```
 
 All environment and network settings are read automatically from the run's `config.json`.
 The best checkpoint (`checkpoints/best.pt`) is loaded automatically.
 
+## EG-TAP Benchmark
+
+```bash
+python scripts/benchmark_egtap.py --N 3 5 10 20 --alpha 0.01 0.05 0.1 0.2 --trials 10
+```
+
 ## GNN architecture
 
 | File | Purpose |
 |------|---------|
-| `gnn_actor_critic.py` | Graph actor, graph critic, native PyTorch message passing |
-| `graph_rollout_buffer.py` | Fixed-N graph rollout buffer |
-| `gnn_mappo.py` | MAPPO trainer using graph observations |
+| `rl_path_planning/gnn_actor_critic.py` | Graph actor, graph critic, native PyTorch message passing |
+| `rl_path_planning/graph_rollout_buffer.py` | Fixed-N graph rollout buffer |
+| `rl_path_planning/gnn_mappo.py` | MAPPO trainer using graph observations |
 
 The first GNN version uses a directed fully connected agent graph:
 - `node_dim = lidar_num_rays + 4 + 2` — `[lidar, ego_motion, assigned_target]`, independent of `num_agents`
