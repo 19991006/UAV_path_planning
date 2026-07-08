@@ -24,15 +24,18 @@ import random
 import sys
 import time
 from pathlib import Path
+
+# Ensure project root is on sys.path for `rl_path_planning` imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from typing import Dict
 
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from env import MultiUAV2DEnv, UAVEnvConfig
-from mappo import MAPPOAgent, MAPPOConfig
-from gnn_mappo import GraphMAPPOAgent
+from rl_path_planning.env import MultiUAV2DEnv, UAVEnvConfig
+from rl_path_planning.mappo import MAPPOAgent, MAPPOConfig
+from rl_path_planning.gnn_mappo import GraphMAPPOAgent
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=600,
                         help="Max environment steps per episode before timeout")
     parser.add_argument("--assigner-name", type=str, default="fixed",
-                        choices=["hungarian", "greedy", "fixed", "cross", "cbba"],
+                        choices=["hungarian", "greedy", "fixed", "cross", "cbba", "egtap"],
                         help="Online target assignment algorithm")
     parser.add_argument("--reassign-interval", type=int, default=10,
                         help="Steps between full reassignments (1 = every step)")

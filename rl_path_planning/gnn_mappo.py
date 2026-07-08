@@ -10,9 +10,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from gnn_actor_critic import GraphActorCritic, GraphNetworkConfig
-from graph_rollout_buffer import GraphBufferConfig, GraphRolloutBuffer
-from mappo import MAPPOConfig
+from rl_path_planning.gnn_actor_critic import GraphActorCritic, GraphNetworkConfig
+from rl_path_planning.graph_rollout_buffer import GraphBufferConfig, GraphRolloutBuffer
+from rl_path_planning.mappo import MAPPOConfig
 
 
 class GraphMAPPOAgent:
