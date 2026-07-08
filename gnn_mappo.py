@@ -91,13 +91,15 @@ class GraphMAPPOAgent:
     # ------------------------------------------------------------------
     def collect_rollout(self) -> Dict[str, float]:
         self.buffer.reset()
-        self.env.reset()
+        episode_seed = self.cfg.training_seed * 10000 + int(self.total_env_steps)
+        self.env.reset(seed=episode_seed)
 
         episode_returns = []
         episode_lengths = []
         current_episode_return = np.zeros((self.num_agents,), dtype=np.float32)
         current_episode_length = 0
         last_transition_done = False
+        episodes_finished_this_rollout = 0
 
         for _ in range(self.cfg.rollout_steps):
             node_features, edge_index, edge_attr = self.env.get_graph_obs()
@@ -141,7 +143,9 @@ class GraphMAPPOAgent:
             if last_transition_done:
                 episode_returns.append(float(np.mean(current_episode_return)))
                 episode_lengths.append(float(current_episode_length))
-                self.env.reset()
+                episodes_finished_this_rollout += 1
+                episode_seed = self.cfg.training_seed * 10000 + int(self.total_env_steps) + episodes_finished_this_rollout
+                self.env.reset(seed=episode_seed)
                 current_episode_return[:] = 0.0
                 current_episode_length = 0
 

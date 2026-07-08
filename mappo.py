@@ -70,6 +70,9 @@ class MAPPOConfig:
     activation: str = "tanh"
     log_std_init: float = -0.5
 
+    # Random seed for generating varied obstacle layouts across episodes.
+    training_seed: int = 42
+
     # Device.
     device: str = "auto"
 
@@ -148,12 +151,14 @@ class MAPPOAgent:
             diagnostics dictionary for this rollout.
         """
         self.buffer.reset()
-        obs = self.env.reset()
+        episode_seed = self.cfg.training_seed * 10000 + int(self.total_env_steps)
+        obs = self.env.reset(seed=episode_seed)
 
         episode_returns = []
         episode_lengths = []
         current_episode_return = np.zeros((self.num_agents,), dtype=np.float32)
         current_episode_length = 0
+        episodes_finished_this_rollout = 0
 
         for _ in range(self.cfg.rollout_steps):
             state = self.env.get_global_state()
@@ -190,7 +195,9 @@ class MAPPOAgent:
             if bool(np.all(dones)):
                 episode_returns.append(float(np.mean(current_episode_return)))
                 episode_lengths.append(float(current_episode_length))
-                obs = self.env.reset()
+                episodes_finished_this_rollout += 1
+                episode_seed = self.cfg.training_seed * 10000 + int(self.total_env_steps) + episodes_finished_this_rollout
+                obs = self.env.reset(seed=episode_seed)
                 current_episode_return[:] = 0.0
                 current_episode_length = 0
 
