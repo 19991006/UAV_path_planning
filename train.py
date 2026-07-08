@@ -199,6 +199,7 @@ def make_agent(env: MultiUAV2DEnv, args: argparse.Namespace):
         num_hidden_layers=args.num_hidden_layers,
         activation=args.activation,
         device=args.device,
+        training_seed=args.seed,
     )
     if args.use_gnn:
         return GraphMAPPOAgent(env, cfg)
@@ -208,48 +209,69 @@ def make_agent(env: MultiUAV2DEnv, args: argparse.Namespace):
 def evaluate_policy(
     agent: MAPPOAgent,
     env: MultiUAV2DEnv,
-    num_episodes: int = 5,
+    eval_seeds: list[int] | None = None,
+    episodes_per_seed: int = 3,
     deterministic: bool = True,
 ) -> Dict[str, float]:
-    """Run evaluation episodes without training."""
-    episode_returns = []
-    episode_lengths = []
+    """Run evaluation episodes across multiple seeds for robust metrics.
+
+    Returns per-seed statistics plus aggregated mean/std across seeds.
+    """
+    if eval_seeds is None:
+        eval_seeds = [env.cfg.seed] if env.cfg.seed is not None else [42]
+
+    all_returns = []     # per-episode (across all seeds)
+    all_lengths = []
     success_count = 0
     collision_count = 0
     timeout_count = 0
+    total_episodes = 0
 
-    for ep in range(num_episodes):
-        obs = env.reset(seed=env.cfg.seed + 10_000 + ep if env.cfg.seed is not None else None)
-        done = False
-        ep_return = np.zeros(env.num_agents, dtype=np.float32)
-        ep_len = 0
-        info = {}
+    per_seed_returns = {}  # seed -> list[float]
 
-        while not done:
-            actions = agent.act(obs, deterministic=deterministic)
-            obs, rewards, dones, info = env.step(actions)
-            ep_return += rewards
-            ep_len += 1
-            done = bool(np.all(dones))
+    for base_seed in eval_seeds:
+        seed_returns = []
+        for ep in range(episodes_per_seed):
+            obs = env.reset(seed=base_seed + ep)
+            done = False
+            ep_return = np.zeros(env.num_agents, dtype=np.float32)
+            ep_len = 0
+            info = {}
 
-        reason = info.get("termination_reason", "")
-        if "success" in reason:
-            success_count += 1
-        if "collision" in reason or "boundary_violation" in reason:
-            collision_count += 1
-        if "timeout" in reason:
-            timeout_count += 1
+            while not done:
+                actions = agent.act(obs, deterministic=deterministic)
+                obs, rewards, dones, info = env.step(actions)
+                ep_return += rewards
+                ep_len += 1
+                done = bool(np.all(dones))
 
-        episode_returns.append(float(np.mean(ep_return)))
-        episode_lengths.append(float(ep_len))
+            reason = info.get("termination_reason", "")
+            if "success" in reason:
+                success_count += 1
+            if "collision" in reason or "boundary_violation" in reason:
+                collision_count += 1
+            if "timeout" in reason:
+                timeout_count += 1
+
+            ret = float(np.mean(ep_return))
+            seed_returns.append(ret)
+            all_returns.append(ret)
+            all_lengths.append(float(ep_len))
+            total_episodes += 1
+
+        per_seed_returns[base_seed] = seed_returns
+
+    # Aggregate: mean-of-seed-means and std-of-seed-means (robustness metrics)
+    seed_means = [float(np.mean(per_seed_returns[s])) for s in eval_seeds]
 
     return {
-        "eval_mean_return": float(np.mean(episode_returns)) if episode_returns else 0.0,
-        "eval_std_return": float(np.std(episode_returns)) if episode_returns else 0.0,
-        "eval_mean_length": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
-        "eval_success_rate": float(success_count / max(num_episodes, 1)),
-        "eval_collision_rate": float(collision_count / max(num_episodes, 1)),
-        "eval_timeout_rate": float(timeout_count / max(num_episodes, 1)),
+        "eval_mean_return": float(np.mean(seed_means)) if seed_means else 0.0,
+        "eval_std_return": float(np.std(seed_means)) if len(seed_means) > 1 else 0.0,
+        "eval_mean_return_pooled": float(np.mean(all_returns)) if all_returns else 0.0,
+        "eval_mean_length": float(np.mean(all_lengths)) if all_lengths else 0.0,
+        "eval_success_rate": float(success_count / max(total_episodes, 1)),
+        "eval_collision_rate": float(collision_count / max(total_episodes, 1)),
+        "eval_timeout_rate": float(timeout_count / max(total_episodes, 1)),
     }
 
 
@@ -317,8 +339,11 @@ def main() -> None:
     writer = SummaryWriter(log_dir)
 
     env = make_env(args, seed_offset=0)
-    eval_env = make_env(args, seed_offset=999)
+    eval_env = make_env(args, seed_offset=0)  # seed handled by evaluate_policy
     agent = make_agent(env, args)
+
+    # Multiple eval seeds for robust generalization metrics
+    eval_seeds = [args.seed + 1000, args.seed + 2000, args.seed + 3000]
     if args.resume_checkpoint:
         print(f"Loading checkpoint from: {args.resume_checkpoint}")
         agent.load(args.resume_checkpoint)
@@ -362,7 +387,8 @@ def main() -> None:
             eval_metrics = evaluate_policy(
                 agent=agent,
                 env=eval_env,
-                num_episodes=args.eval_episodes,
+                eval_seeds=eval_seeds,
+                episodes_per_seed=args.eval_episodes,
                 deterministic=args.deterministic_eval,
             )
             metrics.update(eval_metrics)
