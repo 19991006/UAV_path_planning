@@ -456,13 +456,21 @@ class EGTAPTargetAssigner(BaseTargetAssigner):
 
     Computes a conflict-free one-to-one assignment with O(1/k) convergence.
     Computational complexity: O(2m) per iteration, independent of N.
+
+    A small random perturbation (Algorithm 3) is applied to the cost vectors
+    to break symmetry and prevent the inconsistency phenomenon where the
+    relaxed problem admits non-integer optimal solutions.
     """
 
     def __init__(self, step_size: float = 0.1, max_iterations: int = 5000,
-                 squared_distance: bool = True):
+                 squared_distance: bool = True, perturbation_scale: float = 1e-6,
+                 check_interval: int = 50, seed: int | None = None):
         self.alpha = step_size
         self.max_iterations = max_iterations
         self.squared_distance = squared_distance
+        self.perturbation_scale = perturbation_scale
+        self.check_interval = check_interval
+        self._rng = np.random.default_rng(seed)
 
     def assign(
         self,
@@ -483,6 +491,19 @@ class EGTAPTargetAssigner(BaseTargetAssigner):
         else:
             raw_c = np.sqrt(dist_sq + 1e-8).astype(np.float32)
         c_max = float(np.max(raw_c))
+
+        # Algorithm 3: add small random perturbation to original cost
+        # vectors c_{i,l} to break symmetry and avoid the inconsistency
+        # phenomenon (Huang et al. 2024, Theorem 2).
+        # Per paper, σ̄ is "arbitrarily small"; we scale it by c_max so
+        # the perturbation remains meaningful in float32 for all N.
+        if self.perturbation_scale > 0 and c_max > 0:
+            pert_mag = self.perturbation_scale * c_max
+            raw_c = raw_c + self._rng.uniform(
+                -pert_mag, pert_mag, size=raw_c.shape,
+            ).astype(np.float32)
+            c_max = float(np.max(raw_c))
+
         c = (raw_c / c_max).astype(np.float32) if c_max > 0 else raw_c
 
         # -- communication graph & Laplacian --------------------------
@@ -506,7 +527,8 @@ class EGTAPTargetAssigner(BaseTargetAssigner):
         alpha = self.alpha
         ones_over_N = np.ones((1, m), dtype=np.float32) / float(n)
 
-        for _ in range(self.max_iterations):
+        iterations_run = 0
+        for k in range(self.max_iterations):
             # ---- Step 1: midpoint (Eq 9) ----------------------------
             x_mid = np.clip(x - alpha * (c - mu + lam), 0.0, 1.0)        # 9a
             y_mid = y + alpha * (L @ mu)                                  # 9b
@@ -527,17 +549,25 @@ class EGTAPTargetAssigner(BaseTargetAssigner):
 
             x, y, mu, lam = x_next, y_next, mu_next, lam_next
 
+            # ---- early convergence check -----------------------------
+            if (k + 1) % self.check_interval == 0:
+                trial = np.argmax(x, axis=1)
+                if len(set(trial)) == n:
+                    iterations_run = k + 1
+                    break
+        else:
+            iterations_run = self.max_iterations
+
         # -- discretise: argmax per agent -----------------------------
         assignments = np.argmax(x, axis=1).astype(np.int64)
 
-        # Validate: every agent assigned a unique task.
-        # If EG-TAP did not fully converge (possible with poorly conditioned
-        # 2D Euclidean cost matrices), fall back to Hungarian on the partial x
-        # interpreted as soft assignments.
         if len(set(assignments)) < n:
-            cost_for_h = 1.0 - x  # lower x → more likely assigned
-            row_ind, col_ind = linear_sum_assignment(cost_for_h)
-            assignments = col_ind.astype(np.int64)
+            raise RuntimeError(
+                f"EG-TAP did not converge to a conflict-free assignment "
+                f"within {self.max_iterations} iterations "
+                f"(N={n}, α={self.alpha}). "
+                f"Try increasing max_iterations or adjusting step_size."
+            )
 
         # -- diagnostics ----------------------------------------------
         cost_matrix = dist_sq.astype(np.float32)
@@ -545,7 +575,7 @@ class EGTAPTargetAssigner(BaseTargetAssigner):
         info = {
             "assigner": "eg-tap",
             "total_assignment_cost": total_cost,
-            "iterations": self.max_iterations,
+            "iterations": iterations_run,
         }
         return assignments, cost_matrix, info
 

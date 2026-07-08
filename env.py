@@ -136,12 +136,15 @@ class UAVEnvConfig:
     seed: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if self.num_agents <= 5:
-            scale_factor = 1.0
-        elif 5 < self.num_agents <= 10:
-            scale_factor = 2.0
-        else:
-            scale_factor = 3.0
+        # if self.num_agents <= 5:
+        #     scale_factor = 1.0
+        # elif 5 < self.num_agents <= 10:
+        #     scale_factor = 2.0
+        # else:
+        #     scale_factor = 3.0
+
+        scale_factor = self.num_agents / 5.0
+
         self.world_size *= scale_factor
         self.start_x *= scale_factor
         self.target_x *= scale_factor
