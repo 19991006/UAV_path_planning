@@ -18,12 +18,15 @@ Merged features:
 
 from __future__ import annotations
 
+import time
+
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 
 from rl_path_planning.target_assignment import BaseTargetAssigner, build_assigner
+from rl_path_planning.timing import TimingRecorder
 
 
 @dataclass
@@ -261,6 +264,8 @@ class MultiUAV2DEnv:
         self.done = False
         self.termination_reason = ""
         self.last_reward_terms = {}
+        if not hasattr(self, 'timing'):
+            self.timing = TimingRecorder()
 
         if self.cfg.layout_mode == "cross":
             self._reset_layout_cross()
@@ -710,6 +715,7 @@ class MultiUAV2DEnv:
         )
         comm_adj = (dists <= self.cfg.communication_range) & ~np.eye(self.num_agents, dtype=bool)
 
+        _t0 = time.perf_counter()
         assignments, cost_matrix, assign_info = self.target_assigner.assign(
             agent_positions=self.positions.copy(),
             target_positions=self.target_positions.copy(),
@@ -717,6 +723,7 @@ class MultiUAV2DEnv:
             arrived=self.arrived.copy(),
             communication_graph=comm_adj,
         )
+        self.timing.record_assign(time.perf_counter() - _t0)
 
         assignments = np.asarray(assignments, dtype=np.int64)
         cost_matrix = np.asarray(cost_matrix, dtype=np.float32)
@@ -1176,6 +1183,7 @@ class MultiUAV2DEnv:
             "assignments": self.assignments.copy(),
             "assignment_cost_matrix": self.assignment_cost_matrix.copy(),
             "assignment_info": dict(self.assignment_info),
+            "timing": self.timing.summary(),
             "arrived_bonus_collected": self.arrived.copy(),
             "target_arrived_current": self.target_arrived.copy(),
             "obstacle_centers": self.obstacle_centers.copy(),
