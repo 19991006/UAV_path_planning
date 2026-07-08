@@ -64,6 +64,8 @@ def parse_args() -> argparse.Namespace:
                         help="Override racetrack_front_speed")
     parser.add_argument("--racetrack-back-speed", type=float, default=None,
                         help="Override racetrack_back_speed")
+    parser.add_argument("--reassign-interval", type=int, default=None,
+                        help="Override reassign_interval (1 = every step)")
     parser.add_argument("--save-video", action="store_true",
                         help="Save MP4 video of the best episode")
     parser.add_argument("--video-fps", type=int, default=30,
@@ -108,6 +110,7 @@ def make_env_from_config(train_args: dict, seed_offset: int = 0,
                          racetrack_straight_half_length: float | None = None,
                          racetrack_front_speed: float | None = None,
                          racetrack_back_speed: float | None = None,
+                         reassign_interval: int | None = None,
                          eval_num_agents: int | None = None) -> MultiUAV2DEnv:
     """Build env from saved training config."""
     cfg = UAVEnvConfig(
@@ -120,7 +123,11 @@ def make_env_from_config(train_args: dict, seed_offset: int = 0,
             if assigner_name is not None else
             train_args["assigner_name"]
         ),
-        reassign_interval=train_args.get("reassign_interval", 10),
+        reassign_interval=(
+            reassign_interval
+            if reassign_interval is not None else
+            train_args.get("reassign_interval", 10)
+        ),
         lidar_num_rays=train_args["lidar_num_rays"],
         lidar_range=train_args["lidar_range"],
         layout_mode=(
@@ -230,6 +237,7 @@ def run_episode(
         "collision" in reason or "boundary_violation" in reason)
     timeout = float("timeout" in reason)
 
+    timing_summary = env.timing.summary()
     metrics = {
         "episode_return_mean": float(np.mean(episode_return)),
         "episode_return_sum": float(np.sum(episode_return)),
@@ -237,6 +245,7 @@ def run_episode(
         "success": success,
         "collision_or_boundary": collision_or_boundary,
         "timeout": timeout,
+        **{f"assign_{k}": v for k, v in timing_summary.items()},
     }
 
     trajectory_data = {
@@ -490,6 +499,7 @@ def main() -> None:
         racetrack_straight_half_length=args.racetrack_straight_half_length,
         racetrack_front_speed=args.racetrack_front_speed,
         racetrack_back_speed=args.racetrack_back_speed,
+        reassign_interval=args.reassign_interval,
         eval_num_agents=args.eval_num_agents,
     )
     agent = load_agent_from_run(
