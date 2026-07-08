@@ -464,7 +464,7 @@ class EGTAPTargetAssigner(BaseTargetAssigner):
 
     def __init__(self, step_size: float = 0.1, max_iterations: int = 5000,
                  squared_distance: bool = True, perturbation_scale: float = 1e-6,
-                 check_interval: int = 50, seed: int | None = None):
+                 check_interval: int = 1, seed: int | None = None):
         self.alpha = step_size
         self.max_iterations = max_iterations
         self.squared_distance = squared_distance

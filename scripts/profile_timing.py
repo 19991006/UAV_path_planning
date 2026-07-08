@@ -26,30 +26,44 @@ NODE_DIM = 35 + 4 + 2 + 12  # lidar + ego + target + comm(2*(7-1) for N=7 compat
 EDGE_DIM = 4
 
 
-def random_positions(n: int, rng: np.random.Generator) -> np.ndarray:
-    return rng.uniform(-9.0, 9.0, size=(n, 2)).astype(np.float32)
+def make_positions(n: int, rng: np.random.Generator, x_offset: float) -> np.ndarray:
+    """Generate deterministic layout matching benchmark_egtap.py / env.py.
+    Agents on left (x_offset negative), targets on right (x_offset positive).
+    No random jitter — positions are deterministic to match benchmark_egtap.
+    """
+    sf = n / 5.0
+    start_x = x_offset * sf
+    gap = 4.0
+    center = (n - 1) / 2.0
+    positions = np.zeros((n, 2), dtype=np.float32)
+    for i in range(n):
+        y = (i - center) * gap
+        positions[i, 0] = start_x
+        positions[i, 1] = y
+    return positions
 
 
-def full_adjacency(n: int) -> np.ndarray:
-    adj = np.ones((n, n), dtype=np.float32)
-    np.fill_diagonal(adj, 0.0)
-    return adj
+def distance_adjacency(positions: np.ndarray, comm_range: float = 8.0) -> np.ndarray:
+    dists = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=-1)
+    adj = (dists <= comm_range) & ~np.eye(positions.shape[0], dtype=bool)
+    return adj.astype(np.float32)
 
 
 def profile_assigner(name: str, n_vals: list[int], n_iters: int,
                      rng: np.random.Generator) -> list[dict]:
-    assigner = build_assigner(name)
     results = []
     for n in n_vals:
-        agents = random_positions(n, rng)
-        targets = random_positions(n, rng)
-        comm = full_adjacency(n)
+        assigner = build_assigner(name)
+        agents = make_positions(n, rng, -8.0)
+        targets = make_positions(n, rng, 8.0)
+        comm = distance_adjacency(agents)  # distance-based, matching env.py
         for _ in range(50):
             assigner.assign(agents, targets, communication_graph=comm)
         times = []
         for _ in range(n_iters):
-            agents = random_positions(n, rng)
-            targets = random_positions(n, rng)
+            agents = make_positions(n, rng, -8.0)
+            targets = make_positions(n, rng, 8.0)
+            comm = distance_adjacency(agents)
             t0 = time.perf_counter()
             assigner.assign(agents, targets, communication_graph=comm)
             times.append(time.perf_counter() - t0)
@@ -81,14 +95,14 @@ def profile_inference(n_vals: list[int], n_iters: int, device: str = "cpu") -> l
         ea = torch.randn(ei.shape[1], EDGE_DIM, device=device)
         for _ in range(20):
             with torch.no_grad():
-                model(nodes, ei, ea)
+                model.act(nodes, ei, ea, deterministic=True)
         if device == "cuda":
             torch.cuda.synchronize()
         times = []
         for _ in range(n_iters):
             t0 = time.perf_counter()
             with torch.no_grad():
-                model(nodes, ei, ea)
+                model.act(nodes, ei, ea, deterministic=True)
             if device == "cuda":
                 torch.cuda.synchronize()
             times.append(time.perf_counter() - t0)
